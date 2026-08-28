@@ -158,10 +158,9 @@ class IntentRecognizer:
         self.client    = AsyncAnthropic(**kwargs)
         self.model     = model
         self.threshold = confidence_threshold
-        # 第三方兼容 API（如 DeepSeek）通常不支持 Embedding，禁用该策略。
-        # 官方 Anthropic SDK 当前没有 embeddings 资源，因此下面会使用稳定的
-        # 本地字符 n-gram 向量作为轻量兜底，保证三路融合链路真实可跑。
-        self._embedding_enabled = not bool(base_url)
+        # 本地字符 n-gram 向量始终可用；如果未来客户端暴露 embeddings 资源，
+        # _embed_text 会优先尝试远端向量，否则自动回退本地向量。
+        self._embedding_enabled = True
 
         self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
         self._cache: Dict[str, IntentResult] = {}
@@ -227,6 +226,7 @@ class IntentRecognizer:
         if message not in tpls:
             tpls.append(message)
             self._tpl_embeddings.pop(correct, None)  # 下次重新计算
+            self._cache.clear()  # 模板更新后旧缓存可能对应过时结果
             logger.info(f"学习新样本 → {correct.value}: {message[:40]}")
 
     # ── 三路识别策略 ──────────────────────────────────────────────────────────
@@ -256,11 +256,8 @@ class IntentRecognizer:
 如果用户问题能匹配细粒度业务意图，请优先返回细粒度意图，而不是宽泛大类。
 例如退款优先返回 refund，发票优先返回 invoice，登录故障优先返回 technical_login。
 
-示例:
-{examples}
-
-{ctx}
-用户消息: "{message}"
+        {ctx}
+        用户消息: "{message}"
 
 返回格式（仅 JSON，不要其他文字）:
 {{"intent": "<意图值>", "confidence": <0-1>, "reasoning": "<一句话说明>"}}
@@ -383,7 +380,10 @@ class IntentRecognizer:
             "product": [],
             "date": self._unique(re.findall(r"(今天|明天|昨天|本周|这周|下周|\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?)", message)),
             "amount": self._unique(re.findall(r"((?:¥|￥)\s*\d+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?\s*(?:元|块|rmb|cny|usd|美元))", message, re.I)),
-            "error_code": self._unique(re.findall(r"\b([45]\d{2}|[A-Z][A-Z0-9_-]{2,16})\b", message)),
+            "error_code": self._unique(
+                re.findall(r"(?:error(?:_code)?|错误码|状态码|http)\s*[:：#]?\s*([45]\d{2})\b", message, re.I)
+                + re.findall(r"\b([45]\d{2})\b", message)
+            ),
         }
 
     # ── 辅助 ──────────────────────────────────────────────────────────────────

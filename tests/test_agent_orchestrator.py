@@ -11,6 +11,7 @@ from agents.agent_orchestrator import (
     ResponseComposer,
     RoutingDecision,
     TechnicalAgent,
+    build_shared_rag_tools,
 )
 from core.intent_recognizer import IntentCategory, UrgencyLevel
 
@@ -51,6 +52,7 @@ def test_agent_profiles_have_distinct_contracts_and_generation_config():
     assert GeneralAgent.profile.role != TechnicalAgent.profile.role
     assert TechnicalAgent.profile.workflow != BillingAgent.profile.workflow
     assert TechnicalAgent.profile.temperature < GeneralAgent.profile.temperature
+    assert "search_knowledge_base" in GeneralAgent.profile.tool_scope
     assert "lookup_error_code" in TechnicalAgent.profile.tool_scope
     assert "check_billing_fields" in BillingAgent.profile.tool_scope
 
@@ -120,6 +122,28 @@ def test_agent_tool_scopes_are_real_and_isolated():
     assert escalation_tools == {"create_handoff_summary"}
     assert not general_tools & technical_tools
     assert not technical_tools & billing_tools
+
+
+def test_shared_rag_tool_is_available_to_all_agents():
+    class RagManager:
+        async def search_with_rewrite(self, tool_name, query, top_k=5):
+            return type(
+                "Result",
+                (),
+                {"success": True, "data": [{"title": "退款政策", "content": "7 天内可退款"}], "reranked": True},
+            )()
+
+    shared = build_shared_rag_tools(RagManager())
+
+    general = GeneralAgent(FakeClient(), "test-model")
+    technical = TechnicalAgent(FakeClient(), "test-model")
+    billing = BillingAgent(FakeClient(), "test-model")
+    escalation = EscalationAgent(FakeClient(), "test-model")
+
+    for agent in (general, technical, billing, escalation):
+        agent.set_shared_tools(shared)
+        tools = agent.get_tools()
+        assert "search_knowledge_base" in tools
 
 
 def test_tool_input_validation_rejects_unknown_fields():

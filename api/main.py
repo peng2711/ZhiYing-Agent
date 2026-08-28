@@ -70,7 +70,7 @@ async def lifespan(app: FastAPI):
 
     print(BANNER, flush=True)
 
-    from agents.agent_orchestrator import AgentOrchestrator, Request
+    from agents.agent_orchestrator import AgentOrchestrator, Request, build_shared_rag_tools
     from core.intent_recognizer import IntentRecognizer
     from evaluation.evaluator import EndToEndEvaluator
     from mcp.knowledge_base import KnowledgeBase
@@ -155,6 +155,8 @@ async def lifespan(app: FastAPI):
         supports_rerank=True,
         fallback=knowledge_fallback,
     ))
+    if _orchestrator is not None:
+        _orchestrator.set_shared_tools(build_shared_rag_tools(_tool_manager))
 
     # 性能监控（可选启动 Prometheus）
     prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
@@ -280,11 +282,7 @@ async def chat(req: ChatRequest):
     ] if mem_ctx.recent_messages else None
 
     intent_result = await _orchestrator.recognize_intent(req.message, history=history)
-    knowledge_text, knowledge_used = await _build_knowledge_context(req.message, intent=intent_result.intent)
-    context_parts = [mem_ctx.to_prompt_text()]
-    if knowledge_text:
-        context_parts.append(knowledge_text)
-    full_context = "\n\n".join(part for part in context_parts if part)
+    full_context = mem_ctx.to_prompt_text()
 
     orch_req = OrcReq(
         message=req.message,
@@ -323,7 +321,7 @@ async def chat(req: ChatRequest):
         routing_confidence=result.routing_confidence,
         escalated=result.escalated,
         latency_ms=round(result.latency_ms, 1),
-        knowledge_used=knowledge_used,
+        knowledge_used="search_knowledge_base" in result.tools_used,
         entities=intent_result.entities,
         intent_confidence=round(intent_result.confidence, 4),
         intent_source_scores=intent_result.source_scores,

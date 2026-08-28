@@ -24,10 +24,18 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 from anthropic import AsyncAnthropic
 
+from agents.tools import (
+    AgentToolSpec,
+    build_shared_rag_tools,
+    billing_tools,
+    escalation_tools,
+    general_tools,
+    technical_tools,
+)
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
 
@@ -62,39 +70,6 @@ class AgentProfile:
     model: Optional[str] = None
     temperature: float = 0.2
     max_tokens: int = 1024
-
-
-AgentToolHandler = Callable[["Request", Dict[str, Any]], Union[Any, Awaitable[Any]]]
-
-
-@dataclass(frozen=True)
-class AgentToolSpec:
-    """Agent 可见工具的定义和执行函数。"""
-
-    name: str
-    description: str
-    input_schema: Dict[str, Any]
-    handler: AgentToolHandler
-
-
-def _tool_spec(
-    name: str,
-    description: str,
-    properties: Dict[str, Any],
-    handler: AgentToolHandler,
-    required: Optional[List[str]] = None,
-) -> AgentToolSpec:
-    return AgentToolSpec(
-        name=name,
-        description=description,
-        input_schema={
-            "type": "object",
-            "properties": properties,
-            "required": required or [],
-            "additionalProperties": False,
-        },
-        handler=handler,
-    )
 
 
 def _env_float(name: str, default: float) -> float:
@@ -164,101 +139,6 @@ class Request:
     request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
 
 
-def _tool_context_snapshot(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """通用客服工具：返回脱敏后的当前请求快照。"""
-    return {
-        "intent": req.intent.value if req.intent else None,
-        "intent_group": req.intent_group,
-        "urgency": req.urgency.name if req.urgency else None,
-        "intent_confidence": round(req.intent_confidence, 4),
-        "entities": req.entities or {},
-        "context_available": bool(req.context),
-        "requested_focus": str(args.get("focus", "general"))[:40],
-    }
-
-
-def _general_required_fields(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """通用客服工具：按业务类型计算下一轮只需询问的字段。"""
-    intent = req.intent.value if req.intent else "other"
-    fields: List[str] = []
-    if intent in {"order_status", "logistics"}:
-        fields = ["订单号或下单时间"]
-    elif intent in {"account", "account_security"}:
-        fields = ["登录方式或账号标识", "问题发生时间"]
-    elif intent in {"complaint", "request"}:
-        fields = ["事件时间", "期望处理方式"]
-    elif intent == "other":
-        fields = ["希望解决的具体问题"]
-    return {"intent": intent, "required_fields": fields, "known_entities": req.entities or {}}
-
-
-def _technical_error_lookup(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """技术工具：解释常见错误码的排查方向，不声称读取了服务端日志。"""
-    code = str(args.get("error_code", "")).upper().strip()
-    mapping = {
-        "401": ("认证失败", ["确认 Token/API Key 是否过期", "确认请求时间戳和签名", "确认账号登录状态"]),
-        "403": ("权限不足", ["确认账号或套餐权限", "确认资源权限和 IP 白名单"]),
-        "404": ("资源或路径不存在", ["确认接口路径和环境", "确认资源标识是否正确"]),
-        "500": ("服务端处理异常", ["记录 request_id 和发生时间", "检查依赖服务、参数格式和服务端日志"]),
-    }
-    meaning, steps = mapping.get(code, ("暂未识别的错误码", ["补充完整错误信息、发生时间和运行环境"]))
-    return {"error_code": code, "meaning": meaning, "next_steps": steps, "server_log_checked": False}
-
-
-def _technical_diagnostic_plan(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """技术工具：生成低风险排障顺序。"""
-    environment = str(args.get("environment", "unknown"))[:80]
-    reproduced = bool(args.get("reproduced", False))
-    steps = ["复现并记录完整错误信息", "确认网络、DNS、代理和证书", "确认版本、配置和权限"]
-    if reproduced:
-        steps.append("用最小请求复现并记录 request_id")
-    return {"environment": environment, "reproduced": reproduced, "diagnostic_steps": steps}
-
-
-def _billing_field_check(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """账单工具：检查必要核验字段是否齐全。"""
-    fields = {
-        "order_id": bool(req.entities.get("order_id")),
-        "amount": bool(req.entities.get("amount")),
-        "date": bool(req.entities.get("date")),
-        "payment_channel": bool(args.get("payment_channel")),
-    }
-    return {
-        "fields": fields,
-        "missing_fields": [name for name, present in fields.items() if not present],
-        "can_confirm_refund": False,
-        "reason": "当前工具只做字段检查，不连接订单或支付系统",
-    }
-
-
-def _billing_amount_difference(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """账单工具：只做用户明确提供金额之间的算术，不判断扣款是否合法。"""
-    try:
-        first = float(args["amount_a"])
-        second = float(args["amount_b"])
-    except (KeyError, TypeError, ValueError):
-        return {"success": False, "error": "amount_a 和 amount_b 必须是数字"}
-    return {
-        "success": True,
-        "amount_a": first,
-        "amount_b": second,
-        "difference": round(first - second, 2),
-        "interpretation": "仅表示金额差值，不代表重复扣款或退款结论",
-    }
-
-
-def _handoff_summary(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """升级工具：生成可交给人工客服的结构化摘要。"""
-    return {
-        "request_id": req.request_id,
-        "reason": str(args.get("reason", "需要人工客服继续核验"))[:120],
-        "intent": req.intent.value if req.intent else "unknown",
-        "urgency": req.urgency.name if req.urgency else "UNKNOWN",
-        "entities": req.entities or {},
-        "sensitive_data_required": False,
-    }
-
-
 @dataclass
 class OrchestratorResult:
     request_id:  str
@@ -314,10 +194,14 @@ class BaseAgent:
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
         self._last_tools_used: List[str] = []
+        self._shared_tools: Dict[str, AgentToolSpec] = {}
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         """返回该角色真实可调用的工具白名单。"""
-        return {}
+        return dict(self._shared_tools)
+
+    def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
+        self._shared_tools = dict(tools or {})
 
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
@@ -498,7 +382,7 @@ class GeneralAgent(BaseAgent):
         input_contract=("对话历史", "用户画像", "意图与紧急度", "知识库上下文"),
         output_contract=("先回应核心问题", "信息不足时只询问必要字段", "明确下一步和边界"),
         handoff_conditions=("涉及权限、资金、隐私或复杂投诉", "用户明确要求人工"),
-        tool_scope=("inspect_request_context", "suggest_required_fields"),
+        tool_scope=("search_knowledge_base", "inspect_request_context", "suggest_required_fields"),
         temperature=0.3,
         max_tokens=900,
     )
@@ -514,20 +398,9 @@ class GeneralAgent(BaseAgent):
         return json.dumps(packet, ensure_ascii=False)
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
-        return {
-            "inspect_request_context": _tool_spec(
-                "inspect_request_context",
-                "查看当前请求的意图、紧急度、实体和上下文可用性；不查询外部业务系统。",
-                {"focus": {"type": "string", "description": "希望关注的业务方向"}},
-                _tool_context_snapshot,
-            ),
-            "suggest_required_fields": _tool_spec(
-                "suggest_required_fields",
-                "根据当前意图建议下一轮只需向用户补充的字段。",
-                {},
-                _general_required_fields,
-            ),
-        }
+        tools = super().get_tools()
+        tools.update(general_tools())
+        return tools
 
 
 class TechnicalAgent(BaseAgent):
@@ -539,7 +412,7 @@ class TechnicalAgent(BaseAgent):
         input_contract=("错误码", "问题发生时间", "运行环境", "影响范围", "最近变更", "知识库上下文"),
         output_contract=("现象复述", "可能原因", "编号排查步骤", "验证结果", "需要补充的信息"),
         handoff_conditions=("生产大面积不可用", "数据丢失或权限异常", "需要后台日志、数据库或人工操作"),
-        tool_scope=("lookup_error_code", "build_diagnostic_plan"),
+        tool_scope=("search_knowledge_base", "lookup_error_code", "build_diagnostic_plan"),
         temperature=0.1,
         max_tokens=1200,
     )
@@ -558,25 +431,9 @@ class TechnicalAgent(BaseAgent):
         return json.dumps(packet, ensure_ascii=False)
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
-        return {
-            "lookup_error_code": _tool_spec(
-                "lookup_error_code",
-                "解释常见 HTTP 错误码的可能含义和低风险排查方向；不会读取服务端日志。",
-                {"error_code": {"type": "string", "description": "例如 401、403、500"}},
-                _technical_error_lookup,
-                required=["error_code"],
-            ),
-            "build_diagnostic_plan": _tool_spec(
-                "build_diagnostic_plan",
-                "根据运行环境和是否可复现生成排障顺序，不执行修改配置等操作。",
-                {
-                    "environment": {"type": "string", "description": "App、浏览器、服务端或 Docker 等"},
-                    "reproduced": {"type": "boolean", "description": "问题是否可以稳定复现"},
-                },
-                _technical_diagnostic_plan,
-                required=["environment", "reproduced"],
-            ),
-        }
+        tools = super().get_tools()
+        tools.update(technical_tools())
+        return tools
 
 
 class BillingAgent(BaseAgent):
@@ -588,7 +445,7 @@ class BillingAgent(BaseAgent):
         input_contract=("订单号", "金额与币种", "支付时间", "支付渠道", "用户期望", "知识库上下文"),
         output_contract=("需要核验的信息", "当前可判断内容", "下一步处理路径", "时效边界"),
         handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
-        tool_scope=("check_billing_fields", "compare_amounts"),
+        tool_scope=("search_knowledge_base", "check_billing_fields", "compare_amounts"),
         temperature=0.0,
         max_tokens=1100,
     )
@@ -614,24 +471,9 @@ class BillingAgent(BaseAgent):
         return json.dumps(packet, ensure_ascii=False)
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
-        return {
-            "check_billing_fields": _tool_spec(
-                "check_billing_fields",
-                "检查账单核验字段是否齐全；不连接订单、支付或退款系统。",
-                {"payment_channel": {"type": "string", "description": "支付渠道，例如微信、支付宝、银行卡"}},
-                _billing_field_check,
-            ),
-            "compare_amounts": _tool_spec(
-                "compare_amounts",
-                "计算用户明确提供的两笔金额差值；不判断是否重复扣款，也不执行退款。",
-                {
-                    "amount_a": {"type": "number", "description": "第一笔金额"},
-                    "amount_b": {"type": "number", "description": "第二笔金额"},
-                },
-                _billing_amount_difference,
-                required=["amount_a", "amount_b"],
-            ),
-        }
+        tools = super().get_tools()
+        tools.update(billing_tools())
+        return tools
 
 
 class EscalationAgent(BaseAgent):
@@ -649,21 +491,16 @@ class EscalationAgent(BaseAgent):
         input_contract=("用户消息", "意图", "紧急度", "结构化实体", "对话背景"),
         output_contract=("升级原因", "已知信息摘要", "还需补充的信息", "保守的后续说明"),
         handoff_conditions=("用户明确要求人工", "紧急或高风险场景"),
-        tool_scope=("create_handoff_summary",),
+        tool_scope=("search_knowledge_base", "create_handoff_summary"),
         temperature=0.0,
         max_tokens=500,
     )
     system_prompt = "你负责客服人工升级交接，不要继续模拟已完成的后台操作。"
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
-        return {
-            "create_handoff_summary": _tool_spec(
-                "create_handoff_summary",
-                "生成交给人工客服的结构化交接摘要，不会创建真实工单。",
-                {"reason": {"type": "string", "description": "需要升级的原因"}},
-                _handoff_summary,
-            ),
-        }
+        tools = super().get_tools()
+        tools.update(escalation_tools())
+        return tools
 
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
@@ -776,6 +613,7 @@ class AgentOrchestrator:
         base_url: Optional[str] = None,
         model:    str = "claude-3-5-sonnet-20241022",
         skill_manager: Optional[Any] = None,
+        rag_tool_manager: Optional[Any] = None,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -785,6 +623,7 @@ class AgentOrchestrator:
         self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
         self._skill_manager = skill_manager
         self._composer = ResponseComposer(client, model, skill_manager)
+        self._shared_tools: Dict[str, AgentToolSpec] = {}
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
@@ -793,6 +632,7 @@ class AgentOrchestrator:
             AgentType.BILLING: [self._make_agent(BillingAgent, client, model, skill_manager)],
             AgentType.ESCALATION: [self._make_agent(EscalationAgent, client, model, skill_manager)],
         }
+        self.set_shared_tools(build_shared_rag_tools(rag_tool_manager))
 
     @staticmethod
     def _make_agent(
@@ -819,6 +659,13 @@ class AgentOrchestrator:
         for agents in self._pool.values():
             for agent in agents:
                 agent._skill_manager = skill_manager
+
+    def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
+        """更新所有 Agent 共享的工具白名单。"""
+        self._shared_tools = dict(tools or {})
+        for agents in self._pool.values():
+            for agent in agents:
+                agent.set_shared_tools(self._shared_tools)
 
     async def recognize_intent(
         self,
