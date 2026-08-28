@@ -213,6 +213,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     conv_id:     str
+    request_id:  str = ""
     response:    str
     intent:      str
     intent_group: str = "other"
@@ -319,6 +320,7 @@ async def chat(req: ChatRequest):
 
     return ChatResponse(
         conv_id=conv_id,
+        request_id=result.request_id,
         response=result.response,
         intent=result.intent.value if result.intent else "other",
         intent_group=intent_result.intent_group,

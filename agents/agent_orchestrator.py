@@ -315,6 +315,7 @@ class BaseAgent:
                         "agent_type": self.agent_type.value,
                         "tool_name": name,
                         "tool_use_id": tool_use_id,
+                        "input": dict(args),
                         "success": call_success,
                         "result_success": result_success,
                         "latency_ms": round(tool_latency_ms, 1),
