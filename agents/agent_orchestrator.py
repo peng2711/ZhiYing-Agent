@@ -22,6 +22,8 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
+from datetime import datetime
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
@@ -53,12 +55,6 @@ class AgentType(Enum):
 
 @dataclass(frozen=True)
 class AgentProfile:
-    """运行时角色契约。
-
-    TradingAgents 的角色差异来自节点职责、输入状态和工具边界，而不只是
-    system prompt。这里把这些差异显式化，方便配置、观测和后续扩展 Agent
-    variant。``model`` 为空时继承编排器的默认模型。
-    """
 
     role: str
     mission: str
@@ -122,6 +118,7 @@ class AgentResponse:
     latency_ms:  float = 0.0
     escalate:    bool  = False   # 是否需要升级
     tools_used:  List[str] = field(default_factory=list)
+    tool_traces: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -151,6 +148,7 @@ class OrchestratorResult:
     primary_agent: Optional[AgentType] = None
     supporting_agents: List[AgentType] = field(default_factory=list)
     tools_used: List[str] = field(default_factory=list)
+    tool_traces: List[Dict[str, Any]] = field(default_factory=list)
     routing_reason: str = ""
     routing_confidence: float = 0.0
 
@@ -194,6 +192,7 @@ class BaseAgent:
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
         self._last_tools_used: List[str] = []
+        self._last_tool_traces: List[Dict[str, Any]] = []
         self._shared_tools: Dict[str, AgentToolSpec] = {}
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
@@ -207,6 +206,7 @@ class BaseAgent:
         t0 = time.monotonic()
         self.stats.total += 1
         self._last_tools_used = []
+        self._last_tool_traces = []
         try:
             content = await self._call_llm(req)
             ms = (time.monotonic() - t0) * 1000
@@ -220,6 +220,7 @@ class BaseAgent:
                 latency_ms=ms,
                 escalate=escalate,
                 tools_used=list(self._last_tools_used),
+                tool_traces=list(self._last_tool_traces),
             )
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
@@ -230,6 +231,7 @@ class BaseAgent:
                 content="抱歉，处理您的请求时出现问题，请稍后重试。",
                 success=False,
                 latency_ms=ms,
+                tool_traces=list(self._last_tool_traces),
             )
 
     async def _call_llm(self, req: Request) -> str:
@@ -252,6 +254,7 @@ class BaseAgent:
 
         tools = self.get_tools()
         tools_used: List[str] = []
+        tool_traces: List[Dict[str, Any]] = []
         for _ in range(3):
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
@@ -282,8 +285,14 @@ class BaseAgent:
                 tool_use_id = self._block_value(block, "id")
                 args = self._block_value(block, "input") or {}
                 spec = tools.get(name)
+                tool_t0 = time.monotonic()
+                call_success = True
+                result_success: Optional[bool] = None
+                error_text = ""
                 if spec is None:
+                    call_success = False
                     result: Any = {"success": False, "error": f"工具不在 {self.agent_type.value} Agent 白名单中"}
+                    error_text = result["error"]
                 else:
                     try:
                         self._validate_tool_input(spec, args)
@@ -291,9 +300,29 @@ class BaseAgent:
                         if inspect.isawaitable(result):
                             result = await result
                         tools_used.append(name)
+                        if isinstance(result, dict) and "success" in result:
+                            result_success = bool(result.get("success"))
                     except Exception as ex:
+                        call_success = False
                         logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
-                        result = {"success": False, "error": str(ex)}
+                        error_text = str(ex)
+                        result = {"success": False, "error": error_text}
+                tool_latency_ms = (time.monotonic() - tool_t0) * 1000
+                if not error_text and isinstance(result, dict):
+                    error_text = str(result.get("error", "") or "")
+                tool_traces.append(
+                    {
+                        "agent_type": self.agent_type.value,
+                        "tool_name": name,
+                        "tool_use_id": tool_use_id,
+                        "success": call_success,
+                        "result_success": result_success,
+                        "latency_ms": round(tool_latency_ms, 1),
+                        "cached": bool(result.get("cached")) if isinstance(result, dict) else False,
+                        "reranked": bool(result.get("reranked")) if isinstance(result, dict) else False,
+                        "error": error_text,
+                    }
+                )
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
@@ -302,6 +331,7 @@ class BaseAgent:
             messages.append({"role": "user", "content": tool_results})
 
         self._last_tools_used = tools_used
+        self._last_tool_traces = tool_traces
         raise RuntimeError(f"{self.agent_type.value} 工具调用超过最大轮数")
 
     @staticmethod
@@ -624,6 +654,7 @@ class AgentOrchestrator:
         self._skill_manager = skill_manager
         self._composer = ResponseComposer(client, model, skill_manager)
         self._shared_tools: Dict[str, AgentToolSpec] = {}
+        self._recent_tool_traces = deque(maxlen=_env_int("ECHOMIND_TOOL_TRACE_MAX", 200))
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
@@ -643,7 +674,6 @@ class AgentOrchestrator:
     ) -> BaseAgent:
         """按角色创建 Agent，并允许用环境变量覆盖该角色的模型。
 
-        这对应 TradingAgents 的 quick/deep model 分工：客服场景中技术诊断
         可使用更强模型，通用接待可使用更快模型，升级节点本身不需要调用 LLM。
         """
         profile = agent_cls.profile
@@ -675,6 +705,32 @@ class AgentOrchestrator:
         """对外暴露意图识别，供 API 层先判断是否需要 RAG 等前置能力。"""
         return await self._intent_recognizer.recognize(message, history=history)
 
+    def _record_tool_trace(self, result: OrchestratorResult) -> None:
+        trace = {
+            "request_id": result.request_id,
+            "timestamp": datetime.now().isoformat(),
+            "intent": result.intent.value if result.intent else None,
+            "primary_agent": result.primary_agent.value if result.primary_agent else None,
+            "supporting_agents": [agent.value for agent in result.supporting_agents],
+            "tools_used": list(result.tools_used),
+            "tool_calls": list(result.tool_traces),
+            "escalated": result.escalated,
+            "latency_ms": round(result.latency_ms, 1),
+        }
+        self._recent_tool_traces.append(trace)
+
+    def get_tool_trace(self, request_id: str) -> Optional[Dict[str, Any]]:
+        for trace in reversed(self._recent_tool_traces):
+            if trace.get("request_id") == request_id:
+                return trace
+        return None
+
+    def get_recent_tool_traces(self, limit: int = 20) -> List[Dict[str, Any]]:
+        if not self._recent_tool_traces:
+            return []
+        limit = max(1, min(int(limit or 20), len(self._recent_tool_traces)))
+        return list(reversed(list(self._recent_tool_traces)[-limit:]))
+
     # ── 主入口 ────────────────────────────────────────────────────────────────
 
     async def run(self, req: Request) -> OrchestratorResult:
@@ -693,7 +749,7 @@ class AgentOrchestrator:
             req.intent_confidence = intent_result.confidence
 
         if self._needs_clarification(req):
-            return OrchestratorResult(
+            result = OrchestratorResult(
                 request_id=req.request_id,
                 response="我还不能确定您要处理的是哪类问题。请补充一下是订单物流、退款账单、账户资料，还是技术故障？",
                 agent_type=AgentType.GENERAL,
@@ -705,6 +761,8 @@ class AgentOrchestrator:
                 routing_reason="低置信度 OTHER 意图，先澄清用户需求",
                 routing_confidence=req.intent_confidence,
             )
+            self._record_tool_trace(result)
+            return result
 
         # 复杂问题自动并行协作，例如同一句同时涉及登录故障和扣款/退款。
         decision = self._route_decision(req)
@@ -724,7 +782,7 @@ class AgentOrchestrator:
             logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
             # 生产环境：此处创建工单、通知人工客服
 
-        return OrchestratorResult(
+        result = OrchestratorResult(
             request_id=req.request_id,
             response=response.content,
             agent_type=response.agent_type,
@@ -735,9 +793,12 @@ class AgentOrchestrator:
             primary_agent=decision.primary_agent,
             supporting_agents=[],
             tools_used=list(response.tools_used),
+            tool_traces=list(response.tool_traces),
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
         )
+        self._record_tool_trace(result)
+        return result
 
     async def run_parallel(self, req: Request, decision: RoutingDecision) -> OrchestratorResult:
         """
@@ -757,8 +818,12 @@ class AgentOrchestrator:
             for response in valid_responses
             for tool_name in response.tools_used
         ))
-
-        return OrchestratorResult(
+        tool_traces = [
+            trace
+            for response in valid_responses
+            for trace in response.tool_traces
+        ]
+        result = OrchestratorResult(
             request_id=req.request_id,
             response=combined,
             agent_type=decision.primary_agent,
@@ -772,9 +837,12 @@ class AgentOrchestrator:
             primary_agent=decision.primary_agent,
             supporting_agents=decision.supporting_agents,
             tools_used=tools_used,
+            tool_traces=tool_traces,
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
         )
+        self._record_tool_trace(result)
+        return result
 
     # ── 路由逻辑 ──────────────────────────────────────────────────────────────
 

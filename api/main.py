@@ -231,6 +231,16 @@ class ChatResponse(BaseModel):
     intent_source_scores: Dict[str, float] = Field(default_factory=dict)
 
 
+class ToolTraceResponse(BaseModel):
+    request_id: str
+    found: bool
+    trace: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RecentToolTracesResponse(BaseModel):
+    items: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 # ── 路由 ──────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
@@ -396,6 +406,27 @@ async def monitor_summary():
     if _monitor is None:
         raise HTTPException(503, "服务未就绪")
     return _monitor.summary()
+
+
+@app.get("/trace/tool/{request_id}", response_model=ToolTraceResponse)
+async def get_tool_trace(request_id: str):
+    """查看某次请求的工具调用明细。"""
+    if _orchestrator is None:
+        raise HTTPException(503, "服务未就绪")
+    trace = _orchestrator.get_tool_trace(request_id)
+    return ToolTraceResponse(
+        request_id=request_id,
+        found=trace is not None,
+        trace=trace or {},
+    )
+
+
+@app.get("/trace/tools", response_model=RecentToolTracesResponse)
+async def list_recent_tool_traces(limit: int = 20):
+    """查看最近 N 次请求的工具调用明细。"""
+    if _orchestrator is None:
+        raise HTTPException(503, "服务未就绪")
+    return RecentToolTracesResponse(items=_orchestrator.get_recent_tool_traces(limit=limit))
 
 
 @app.get("/metrics")

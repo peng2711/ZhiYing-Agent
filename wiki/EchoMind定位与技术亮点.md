@@ -34,7 +34,7 @@ EchoMind 的目标就是把这些能力做成一条完整链路，而不是只�
 
 ## 当前是什么架构
 
-现在的 EchoMind 不是 TradingAgents 那种 LangGraph 状态图，也不是“单 Agent + prompt 变体”的做法。  
+现在的 EchoMind 不是“单 Agent + prompt 变体”的做法。  
 它当前是一个 **路由驱动的多 Agent 编排架构**，核心形态可以概括成：
 
 ```text
