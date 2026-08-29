@@ -5,6 +5,7 @@ EchoMind 智能客服系统 — FastAPI 入口
 所有核心组件在 lifespan 中初始化，通过环境变量配置。
 """
 import asyncio
+import hmac
 import logging
 import os
 import pathlib
@@ -20,7 +21,7 @@ if _ROOT not in sys.path:
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Response, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, Request as FastAPIRequest, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
@@ -52,8 +53,8 @@ _skill_manager = None
 
 def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not key:
-        raise RuntimeError("未设置 ANTHROPIC_API_KEY")
+    if key.strip().lower() in {"", "xxx", "your_api_key", "your-key", "replace-with-your-key"}:
+        raise RuntimeError("未设置有效的 ANTHROPIC_API_KEY")
     cfg: Dict[str, Any] = {
         "api_key":  key,
         "model":    os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022").strip(),
@@ -196,9 +197,42 @@ app = FastAPI(
     docs_url="/docs",
 )
 
+
+_PUBLIC_PATHS = {"/health", "/docs", "/redoc", "/openapi.json", "/metrics"}
+_PLACEHOLDER_API_KEYS = {
+    "xxx", "your_api_key", "your-key", "replace-with-a-long-random-key",
+}
+
+
+@app.middleware("http")
+async def api_key_guard(request: FastAPIRequest, call_next):
+    """可选 API Key 鉴权；生产环境未配置密钥时拒绝业务请求。"""
+    path = request.url.path.rstrip("/") or "/"
+    configured = os.getenv("ECHOMIND_API_KEY", "").strip()
+    if configured.lower() in _PLACEHOLDER_API_KEYS:
+        configured = ""
+    is_public = path in _PUBLIC_PATHS or path.startswith("/docs/") or path.startswith("/redoc/")
+
+    if not is_public:
+        if not configured:
+            if os.getenv("APP_ENV", "development").lower() == "production":
+                return Response("ECHOMIND_API_KEY 未配置", status_code=503)
+        else:
+            provided = request.headers.get("X-API-Key", "")
+            if not hmac.compare_digest(provided, configured):
+                return Response("Unauthorized", status_code=401)
+
+    return await call_next(request)
+
+_cors_origins = [origin.strip() for origin in os.getenv(
+    "ECHOMIND_CORS_ORIGINS", "http://localhost:3000,http://localhost:5173"
+).split(",") if origin.strip()]
+if os.getenv("APP_ENV", "development").lower() != "production" and not _cors_origins:
+    _cors_origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -206,9 +240,9 @@ app.add_middleware(
 
 # ── 请求/响应模型 ─────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
-    message:     str
-    user_id:     str = "anonymous"
-    conv_id:     Optional[str] = None
+    message:     str = Field(min_length=1, max_length=8000)
+    user_id:     str = Field(default="anonymous", min_length=1, max_length=128)
+    conv_id:     Optional[str] = Field(default=None, min_length=1, max_length=128)
 
 
 class ChatResponse(BaseModel):
@@ -221,6 +255,7 @@ class ChatResponse(BaseModel):
     agent_types: List[str] = Field(default_factory=list)
     primary_agent: str = ""
     supporting_agents: List[str] = Field(default_factory=list)
+    tools_attempted: List[str] = Field(default_factory=list)
     tools_used: List[str] = Field(default_factory=list)
     routing_reason: str = ""
     routing_confidence: float = 0.0
@@ -293,6 +328,7 @@ async def chat(req: ChatRequest):
     ] if mem_ctx.recent_messages else None
 
     intent_result = await _orchestrator.recognize_intent(req.message, history=history)
+    # 当前版本采用 Agent Tool Use：RAG 由 Agent 按策略调用，不在 API 层重复预取。
     full_context = mem_ctx.to_prompt_text()
 
     orch_req = OrcReq(
@@ -328,6 +364,7 @@ async def chat(req: ChatRequest):
         agent_types=[agent_type.value for agent_type in result.agent_types],
         primary_agent=result.primary_agent.value if result.primary_agent else result.agent_type.value,
         supporting_agents=[agent_type.value for agent_type in result.supporting_agents],
+        tools_attempted=result.tools_attempted,
         tools_used=result.tools_used,
         routing_reason=result.routing_reason,
         routing_confidence=result.routing_confidence,
@@ -338,68 +375,6 @@ async def chat(req: ChatRequest):
         intent_confidence=round(intent_result.confidence, 4),
         intent_source_scores=intent_result.source_scores,
     )
-
-
-async def _build_knowledge_context(message: str, intent=None, top_k: int = 3) -> tuple[str, bool]:
-    """
-    为 /chat 主链路构建 RAG 知识上下文。
-
-    这里复用 MCPToolManager 的查询改写、并行召回、重排、fallback 能力。
-    """
-    if _tool_manager is None:
-        return "", False
-    if not _should_use_knowledge(message, intent=intent):
-        return "", False
-    try:
-        result = await _tool_manager.search_with_rewrite("knowledge_search", message, top_k=top_k)
-        if not result.success or not isinstance(result.data, list) or not result.data:
-            return "", False
-
-        parts = ["[知识库检索结果]"]
-        used = False
-        for i, item in enumerate(result.data[:top_k], start=1):
-            if not isinstance(item, dict):
-                continue
-            title = str(item.get("title", "未命名文档"))
-            content = str(item.get("content", "")).strip()
-            score = item.get("score", "")
-            if not content:
-                continue
-            used = True
-            parts.append(f"{i}. 标题: {title}\n   相关度: {score}\n   内容: {content[:600]}")
-
-        if not used:
-            return "", False
-        parts.append("请优先依据以上知识库内容回答；如果知识库内容不足，再结合通用客服能力说明。")
-        return "\n".join(parts), True
-    except Exception as ex:
-        logger.warning(f"构建知识库上下文失败: {ex}")
-        return "", False
-
-
-def _should_use_knowledge(message: str, intent=None) -> bool:
-    """跳过纯寒暄，业务类问题才检索知识库，避免无关 RAG 干扰回复。"""
-    msg = (message or "").strip().lower()
-    if not msg:
-        return False
-    intent_value = getattr(intent, "value", intent)
-    if intent_value in {"greeting", "feedback", "escalation", "human_handoff", "other"}:
-        return False
-    if intent_value in {
-        "query", "request", "technical", "billing", "account", "complaint",
-        "order_status", "logistics", "refund", "invoice", "payment_issue",
-        "account_security", "technical_login", "technical_crash",
-    }:
-        return True
-    greetings = {"你好", "您好", "嗨", "hi", "hello", "hey", "早上好", "晚上好"}
-    if msg in greetings:
-        return False
-    business_keywords = [
-        "退款", "订单", "物流", "配送", "发票", "扣款", "支付", "账单", "订阅",
-        "登录", "报错", "错误", "崩溃", "会员", "积分", "账户", "密码", "地址",
-        "refund", "order", "invoice", "payment", "error", "login",
-    ]
-    return len(msg) >= 4 or any(kw in msg for kw in business_keywords)
 
 
 @app.get("/monitor")
@@ -424,7 +399,7 @@ async def get_tool_trace(request_id: str):
 
 
 @app.get("/trace/tools", response_model=RecentToolTracesResponse)
-async def list_recent_tool_traces(limit: int = 20):
+async def list_recent_tool_traces(limit: int = Query(default=20, ge=1, le=100)):
     """查看最近 N 次请求的工具调用明细。"""
     if _orchestrator is None:
         raise HTTPException(503, "服务未就绪")
@@ -438,7 +413,7 @@ async def prometheus_metrics():
 
 
 @app.post("/search")
-async def search(query: str, top_k: int = 5):
+async def search(query: str = Query(min_length=1, max_length=8000), top_k: int = Query(default=5, ge=1, le=10)):
     """
     演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
     展示 MCP 工具调用的核心亮点。
@@ -451,34 +426,35 @@ async def search(query: str, top_k: int = 5):
 
 class DocInput(BaseModel):
     """单篇文档输入。"""
-    title:   str
-    content: str
+    source_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    title:   str = Field(min_length=1, max_length=256)
+    content: str = Field(min_length=1, max_length=200_000)
 
 
 class BatchDocInput(BaseModel):
     """批量文档导入请求体。"""
-    documents: List[DocInput]
+    documents: List[DocInput] = Field(min_length=1, max_length=100)
 
 
 class EvalIntentInput(BaseModel):
     """意图识别评测用例。"""
-    message: str
-    expected_intent: str
+    message: str = Field(min_length=1, max_length=8000)
+    expected_intent: str = Field(min_length=1, max_length=64)
     context: Optional[Dict[str, Any]] = None
 
 
 class EvalDialogInput(BaseModel):
     """对话质量评测用例。question 单轮，turns 多轮。"""
-    question: Optional[str] = None
-    turns: Optional[List[str]] = None
-    user_id: Optional[str] = None
-    conv_id: Optional[str] = None
+    question: Optional[str] = Field(default=None, max_length=8000)
+    turns: Optional[List[str]] = Field(default=None, max_length=50)
+    user_id: Optional[str] = Field(default=None, max_length=128)
+    conv_id: Optional[str] = Field(default=None, max_length=128)
 
 
 class EvalRunInput(BaseModel):
     """评测请求。为空时使用内置默认用例。"""
-    intent_cases: Optional[List[EvalIntentInput]] = None
-    dialog_cases: Optional[List[EvalDialogInput]] = None
+    intent_cases: Optional[List[EvalIntentInput]] = Field(default=None, max_length=500)
+    dialog_cases: Optional[List[EvalDialogInput]] = Field(default=None, max_length=100)
 
 
 @app.post("/knowledge/add", tags=["知识库"])
@@ -502,7 +478,9 @@ async def add_knowledge(body: BatchDocInput):
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    count = await kb.add_documents_async([{"title": d.title, "content": d.content} for d in body.documents])
+    count = await kb.add_documents_async([
+        d.model_dump(exclude_none=True) for d in body.documents
+    ])
     total = await kb.doc_count_async()
     return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": total}
 
@@ -542,6 +520,13 @@ async def upload_knowledge(file: UploadFile = File(...)):
         # txt / md：整个文件作为一篇文档
         title = filename.rsplit(".", 1)[0] if "." in filename else filename
         docs = [{"title": title, "content": text}]
+
+    if not isinstance(docs, list) or not 1 <= len(docs) <= 100:
+        raise HTTPException(400, "文档数量必须在 1-100 之间")
+    try:
+        docs = [DocInput(**doc).model_dump(exclude_none=True) for doc in docs]
+    except Exception as ex:
+        raise HTTPException(400, f"文档格式不合法: {ex}")
 
     count = await kb.add_documents_async(docs)
     total = await kb.doc_count_async()

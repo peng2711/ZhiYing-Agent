@@ -82,17 +82,37 @@ class KnowledgeBase:
         for doc in documents:
             title   = doc.get("title", "")
             content = doc.get("content", "")
+            # source_id 用于文档更新时清理旧切片；未提供时按标题生成稳定键。
+            source_id = str(doc.get("source_id") or hashlib.sha256(title.encode("utf-8")).hexdigest()[:16])
             chunks  = self._chunk_text(content, chunk_size=500)
 
+            # 同一来源重复导入应覆盖旧版本，避免旧政策和新政策同时被召回。
+            try:
+                self._collection.delete(where={"source_id": source_id})
+            except Exception:
+                # 兼容历史 collection（旧切片没有 source_id 元数据）。
+                logger.debug("知识库旧版本清理跳过: source_id=%s", source_id, exc_info=True)
+
             for i, chunk in enumerate(chunks):
-                doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
+                # 使用完整 chunk 生成稳定 ID，重复导入相同文档时幂等。
+                doc_id = hashlib.sha256(f"{title}\0{i}\0{chunk}".encode("utf-8")).hexdigest()
                 ids.append(doc_id)
                 docs.append(chunk)
-                metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
+                metas.append({
+                    "title": title,
+                    "source_id": source_id,
+                    "chunk_index": i,
+                    "total_chunks": len(chunks),
+                })
 
         if ids:
             # ChromaDB 会自动生成 Embedding
-            self._collection.add(ids=ids, documents=docs, metadatas=metas)
+            # upsert 兼容文档重复导入和内容更新；老版本客户端没有 upsert 时回退到 add。
+            upsert = getattr(self._collection, "upsert", None)
+            if upsert is not None:
+                upsert(ids=ids, documents=docs, metadatas=metas)
+            else:
+                self._collection.add(ids=ids, documents=docs, metadatas=metas)
             logger.info(f"知识库导入 {len(ids)} 个文档片段")
 
         return len(ids)
@@ -160,6 +180,7 @@ class KnowledgeBase:
 
     def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
         """将长文本按 chunk_size 切片，保留语义完整性（按句号/换行切分）。"""
+        text = str(text or "")
         if len(text) <= chunk_size:
             return [text] if text.strip() else []
 
@@ -174,6 +195,10 @@ class KnowledgeBase:
             if len(current) + len(sent) + 1 > chunk_size:
                 if current:
                     chunks.append(current)
+                # 单句超长时继续硬切，保证 chunk 上限真实生效。
+                while len(sent) > chunk_size:
+                    chunks.append(sent[:chunk_size])
+                    sent = sent[chunk_size:]
                 current = sent
             else:
                 current = f"{current}。{sent}" if current else sent

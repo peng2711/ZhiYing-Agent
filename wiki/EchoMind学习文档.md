@@ -678,9 +678,9 @@ wiki/           项目文档
 
 如果 `/chat` 没有触发知识库：
 
-- 先看意图是否属于业务类
-- 再看 `_should_use_knowledge()` 的判断
-- 最后看 `knowledge_search` 是否成功返回结果
+- 先看意图是否属于事实类业务意图
+- 再看 Agent 是否拥有 `search_knowledge_base` 工具以及首轮 `tool_choice`
+- 最后看工具 trace 中 `tools_attempted`、`result_success` 和 `fallback_used`
 
 如果知识库结果不准，通常排查这几个点：
 
@@ -791,4 +791,3 @@ EchoMind 的核心不是“会聊天”，而是把客服系统里最关键的�
 如果再压缩成一句面试话术，可以说：
 
 > 我做的是一个可观测、可评测、可降级的多 Agent 客服编排系统，把意图识别、路由、知识检索、记忆、Skills、监控和评测串成了完整闭环。
-

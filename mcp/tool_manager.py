@@ -17,6 +17,8 @@ import hashlib
 import inspect
 import json
 import logging
+import os
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -27,6 +29,13 @@ from anthropic import AsyncAnthropic
 from core.llm_utils import extract_text_content
 
 logger = logging.getLogger(__name__)
+
+
+def _llm_timeout_s() -> float:
+    try:
+        return max(1.0, float(os.getenv("ECHOMIND_LLM_TIMEOUT_S", "45")))
+    except (TypeError, ValueError):
+        return 45.0
 
 
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
@@ -44,6 +53,8 @@ class ToolResult:
     tool_name:      str
     error:          Optional[str] = None
     cached:         bool = False
+    fallback_used: bool = False
+    degraded:       bool = False
     latency_ms:     float = 0.0
     reranked:       bool = False   # 是否经过重排
 
@@ -56,6 +67,8 @@ class ToolStats:
     failed:             int = 0
     total_latency_ms:   float = 0.0
     consecutive_fails:  int = 0
+    cache_hits:         int = 0
+    cache_misses:       int = 0
 
     @property
     def success_rate(self) -> float:
@@ -63,7 +76,8 @@ class ToolStats:
 
     @property
     def avg_latency_ms(self) -> float:
-        return self.total_latency_ms / self.total if self.total else 0.0
+        measured = self.total - self.cache_hits
+        return self.total_latency_ms / measured if measured else 0.0
 
 
 # ── 熔断器 ────────────────────────────────────────────────────────────────────
@@ -83,20 +97,25 @@ class CircuitBreaker:
         self.state       = CircuitState.CLOSED
         self.fail_count  = 0
         self.opened_at:  Optional[float] = None
+        self._probe_lock = threading.Lock()
 
     def allow(self) -> bool:
         if self.state == CircuitState.CLOSED:
             return True
         if self.state == CircuitState.OPEN:
             if time.monotonic() - self.opened_at >= self.recovery_s:  # type: ignore
+                if not self._probe_lock.acquire(blocking=False):
+                    return False
                 self.state = CircuitState.HALF_OPEN
                 return True
             return False
-        return True  # HALF_OPEN：放行一次探测
+        return False  # HALF_OPEN：只有持有探测锁的请求可以继续
 
     def record_success(self) -> None:
         self.fail_count = 0
         self.state = CircuitState.CLOSED
+        if self._probe_lock.locked():
+            self._probe_lock.release()
 
     def record_failure(self) -> None:
         self.fail_count += 1
@@ -104,6 +123,8 @@ class CircuitBreaker:
             self.state     = CircuitState.OPEN
             self.opened_at = time.monotonic()
             logger.warning(f"熔断器打开（连续失败 {self.fail_count} 次）")
+        if self._probe_lock.locked():
+            self._probe_lock.release()
 
 
 # ── 工具定义 ──────────────────────────────────────────────────────────────────
@@ -180,6 +201,7 @@ class MCPToolManager:
                 cached_data, cached_reranked = cached
                 tool.stats.total += 1
                 tool.stats.success += 1
+                tool.stats.cache_hits += 1
                 return ToolResult(
                     success=True,
                     data=cached_data,
@@ -188,13 +210,17 @@ class MCPToolManager:
                     reranked=cached_reranked,
                 )
 
+        # 非缓存请求统一计入调用次数，即使被熔断器拒绝也不能从成功率统计中消失。
+        tool.stats.total += 1
+        tool.stats.cache_misses += 1
+
         # 熔断检查
         if not tool.breaker.allow():
             error = f"工具熔断中: {name}，请稍后重试"
+            tool.stats.failed += 1
             return await self._fallback_result(tool, params, context, error)
 
         t0 = time.monotonic()
-        tool.stats.total += 1
         try:
             # 参数校验（根据 JSON Schema 的 required 和 properties.type）
             self._validate_params(tool, params)
@@ -221,6 +247,7 @@ class MCPToolManager:
                               latency_ms=latency, reranked=reranked)
 
         except asyncio.TimeoutError:
+            tool.stats.total_latency_ms += (time.monotonic() - t0) * 1000
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
             tool.breaker.record_failure()
@@ -228,6 +255,7 @@ class MCPToolManager:
             return await self._fallback_result(tool, params, context, "执行超时")
 
         except Exception as ex:
+            tool.stats.total_latency_ms += (time.monotonic() - t0) * 1000
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
             tool.breaker.record_failure()
@@ -249,10 +277,13 @@ class MCPToolManager:
             if asyncio.iscoroutine(data):
                 data = await data
             return ToolResult(
-                success=True,
+                # fallback 是降级结果，不应伪装成真实工具成功。
+                success=False,
                 data=data,
                 tool_name=tool.name,
                 error=error,
+                fallback_used=True,
+                degraded=True,
             )
         except Exception as ex:
             logger.error(f"工具降级失败: {tool.name} — {ex}")
@@ -296,9 +327,12 @@ class MCPToolManager:
 返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
         prompt = self._clean_text(prompt)
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.3,
-                messages=[{"role": "user", "content": prompt}],
+            resp = await asyncio.wait_for(
+                self._client.messages.create(
+                    model=self._model, max_tokens=256, temperature=0.3,
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+                timeout=_llm_timeout_s(),
             )
             raw = extract_text_content(resp.content)
             s, e = raw.find("["), raw.rfind("]") + 1
@@ -375,9 +409,12 @@ class MCPToolManager:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
+            resp = await asyncio.wait_for(
+                self._client.messages.create(
+                    model=self._model, max_tokens=256, temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+                timeout=_llm_timeout_s(),
             )
             raw = extract_text_content(resp.content)
             s, e = raw.find("["), raw.rfind("]") + 1
@@ -459,6 +496,8 @@ class MCPToolManager:
                 "success_rate": round(t.stats.success_rate, 3),
                 "avg_latency_ms": round(t.stats.avg_latency_ms, 1),
                 "consecutive_fails": t.stats.consecutive_fails,
+                "cache_hits": t.stats.cache_hits,
+                "cache_misses": t.stats.cache_misses,
                 "circuit_state": t.breaker.state.value,
             }
             for name, t in self._tools.items()

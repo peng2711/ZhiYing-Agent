@@ -27,6 +27,18 @@ if TYPE_CHECKING:
 
 AgentToolHandler = Callable[["Request", Dict[str, Any]], Union[Any, Awaitable[Any]]]
 
+# 这些意图涉及政策、账单或故障事实，默认要求 Agent 至少检索一次知识库。
+# 这是“路由后 Tool Use”策略，不是旧版 API 层的 eager-RAG。
+RAG_REQUIRED_INTENTS = frozenset({
+    "order_status", "logistics", "refund", "invoice", "payment_issue",
+    "account_security", "technical_login", "technical_crash",
+})
+
+
+def rag_required(intent: Any) -> bool:
+    value = getattr(intent, "value", intent)
+    return str(value or "") in RAG_REQUIRED_INTENTS
+
 
 @dataclass(frozen=True)
 class AgentToolSpec:
@@ -179,7 +191,10 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
 
     async def search_knowledge_base(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
         query = str(args.get("query") or req.message or "").strip()
-        top_k = int(args.get("top_k", 5) or 5)
+        try:
+            top_k = max(1, min(int(args.get("top_k", 5) or 5), 10))
+        except (TypeError, ValueError):
+            return {"success": False, "error": "top_k 必须是 1-10 的整数", "results": []}
         if not query:
             return {"success": False, "error": "query 不能为空", "results": []}
         if tool_manager is None:
@@ -197,6 +212,8 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
                 "error": getattr(result, "error", "知识库检索失败"),
                 "results": [],
                 "reranked": False,
+                "fallback_used": bool(getattr(result, "fallback_used", False)),
+                "degraded": bool(getattr(result, "degraded", False)),
             }
 
         return {
@@ -205,6 +222,7 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
             "top_k": top_k,
             "results": result.data,
             "reranked": bool(getattr(result, "reranked", False)),
+            "fallback_used": bool(getattr(result, "fallback_used", False)),
         }
 
     return {

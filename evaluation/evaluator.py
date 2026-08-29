@@ -16,6 +16,7 @@ LLM-as-Judge 是评测 Agent 质量的关键技术：
 import asyncio
 import json
 import logging
+import os
 import pathlib
 import statistics
 import time
@@ -30,6 +31,13 @@ from core.llm_utils import extract_text_content
 from core.intent_recognizer import IntentCategory, IntentRecognizer
 
 logger = logging.getLogger(__name__)
+
+
+def _llm_timeout_s() -> float:
+    try:
+        return max(1.0, float(os.getenv("ECHOMIND_LLM_TIMEOUT_S", "45")))
+    except (TypeError, ValueError):
+        return 45.0
 
 
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
@@ -54,6 +62,13 @@ class QualityScores:
     @property
     def overall(self) -> float:
         return statistics.mean([self.relevance, self.accuracy, self.completeness, self.helpfulness])
+
+
+def _score(value: Any, default: float = 0.5) -> float:
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -124,18 +139,21 @@ Agent 响应: {response}
         )
         prompt = self._clean_text(prompt)
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
+            resp = await asyncio.wait_for(
+                self._client.messages.create(
+                    model=self._model, max_tokens=256, temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+                timeout=_llm_timeout_s(),
             )
             raw = extract_text_content(resp.content)
             s, e = raw.find("{"), raw.rfind("}") + 1
             data = json.loads(raw[s:e])
             return QualityScores(
-                relevance=float(data.get("relevance", 0.5)),
-                accuracy=float(data.get("accuracy", 0.5)),
-                completeness=float(data.get("completeness", 0.5)),
-                helpfulness=float(data.get("helpfulness", 0.5)),
+                relevance=_score(data.get("relevance")),
+                accuracy=_score(data.get("accuracy")),
+                completeness=_score(data.get("completeness")),
+                helpfulness=_score(data.get("helpfulness")),
             )
         except Exception as ex:
             logger.warning(f"LLM Judge 失败: {ex}")
@@ -317,7 +335,9 @@ class EndToEndEvaluator:
             results=results,
         )
         self._history.append(report)
-        self._save_baseline(report)
+        # 评测不应自动覆盖回归基线；只有显式开启时才提升当前报告为 baseline。
+        if os.getenv("EVAL_AUTO_PROMOTE_BASELINE", "false").lower() in {"1", "true", "yes"}:
+            self._save_baseline(report)
         return report
 
     async def _evaluate_dialog_case(self, case: Dict[str, Any], case_idx: int) -> List[EvalResult]:
@@ -346,7 +366,7 @@ class EndToEndEvaluator:
             actual_answer = orch_result.response
 
             scores = await self._judge.judge(question, actual_answer, context=context or None)
-            passed = scores.overall >= self.PASS_THRESHOLD
+            passed = not scores.judge_failed and scores.overall >= self.PASS_THRESHOLD
 
             history.append({"role": "user", "content": question})
             history.append({"role": "assistant", "content": actual_answer})

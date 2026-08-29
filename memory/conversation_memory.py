@@ -15,6 +15,7 @@ import hashlib
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -86,6 +87,13 @@ class MemoryManager:
     SUMMARY_MAX_CHARS = 800
     PROFILE_DOC_PREFIX = "user_profile:"
 
+    @staticmethod
+    def _llm_timeout_s() -> float:
+        try:
+            return max(1.0, float(os.getenv("ECHOMIND_LLM_TIMEOUT_S", "45")))
+        except (TypeError, ValueError):
+            return 45.0
+
     def __init__(
         self,
         redis_url:    str = "redis://localhost:6379/0",
@@ -103,6 +111,9 @@ class MemoryManager:
         self._model  = model
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
+        # 单进程内保护同一会话的追加/压缩顺序；多实例部署仍应使用 Redis 分布式锁。
+        self._conversation_locks: Dict[str, asyncio.Lock] = {}
+        self._profile_locks: Dict[str, asyncio.Lock] = {}
 
         # ChromaDB：优先连接独立服务（docker compose 模式），连不上则降级为本地嵌入式
         try:
@@ -146,18 +157,20 @@ class MemoryManager:
         msg = Message(role=role, content=self._safe_text(content), metadata=clean_metadata)
         key = self._wm_key(user_id, conv_id)
 
-        # 追加到 Redis 列表（左推，最新在前）
-        await self._redis.lpush(key, json.dumps({
-            "role":      msg.role.value,
-            "content":   msg.content,
-            "ts":        msg.timestamp.isoformat(),
-            "metadata":  msg.metadata,
-        }))
-        await self._redis.expire(key, 86400)  # 24h TTL
+        lock = self._conversation_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            # 追加到 Redis 列表（左推，最新在前）
+            await self._redis.lpush(key, json.dumps({
+                "role":      msg.role.value,
+                "content":   msg.content,
+                "ts":        msg.timestamp.isoformat(),
+                "metadata":  msg.metadata,
+            }))
+            await self._redis.expire(key, 86400)  # 24h TTL
 
-        # 超过压缩阈值时触发压缩
-        if await self._redis.llen(key) >= self.COMPRESS_AT:
-            await self._compress(user_id, conv_id)
+            # 超过压缩阈值时触发压缩，避免同进程并发请求重复重写列表。
+            if await self._redis.llen(key) >= self.COMPRESS_AT:
+                await self._compress(user_id, conv_id)
 
     async def update_profile(self, user_id: str, conv_id: str) -> None:
         """
@@ -166,15 +179,17 @@ class MemoryManager:
         """
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
-        messages = await self._get_working_memory(user_id, conv_id)
-        if not messages:
-            return
+        lock = self._profile_locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            messages = await self._get_working_memory(user_id, conv_id)
+            if not messages:
+                return
 
-        current_profile = await self._get_profile(user_id)
+            current_profile = await self._get_profile(user_id)
 
-        text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in messages[-10:]))
-        profile_ctx = json.dumps(current_profile, ensure_ascii=False) if current_profile else "{}"
-        prompt = f"""从以下对话和已有用户画像中提炼或更新用户偏好和关键实体，返回 JSON。
+            text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in messages[-10:]))
+            profile_ctx = json.dumps(current_profile, ensure_ascii=False) if current_profile else "{}"
+            prompt = f"""从以下对话和已有用户画像中提炼或更新用户偏好和关键实体，返回 JSON。
 对话:
 {text}
 
@@ -182,39 +197,39 @@ class MemoryManager:
 {profile_ctx}
 
 返回格式: {{"preferences": ["..."], "entities": {{"产品": [], "问题类型": []}}}}"""
-        prompt = self._safe_text(prompt)
-
-        try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=512, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("{"), raw.rfind("}") + 1
-            profile_data = json.loads(raw[s:e])
-
-            doc_id = self._profile_doc_id(user_id)
-            doc_text = self._safe_text(json.dumps(profile_data, ensure_ascii=False))
+            prompt = self._safe_text(prompt)
 
             try:
-                await asyncio.to_thread(self._profile.delete, ids=[doc_id])
-            except Exception:
-                pass
+                resp = await asyncio.wait_for(self._client.messages.create(
+                model=self._model, max_tokens=512, temperature=0.0,
+                messages=[{"role": "user", "content": prompt}],
+                ), timeout=self._llm_timeout_s())
+                raw = extract_text_content(resp.content)
+                s, e = raw.find("{"), raw.rfind("}") + 1
+                profile_data = json.loads(raw[s:e])
+
+                doc_id = self._profile_doc_id(user_id)
+                doc_text = self._safe_text(json.dumps(profile_data, ensure_ascii=False))
+
+                try:
+                    await asyncio.to_thread(self._profile.delete, ids=[doc_id])
+                except Exception:
+                    pass
 
             # 直接传 documents，让 ChromaDB 内置模型生成 embedding（不依赖 Voyage API）
-            await asyncio.to_thread(
-                self._profile.add,
-                ids=[doc_id],
-                documents=[doc_text],
-                metadatas=[{
-                    "user_id": user_id,
-                    "conv_id": conv_id,
-                    "updated_at": datetime.now().isoformat(),
-                }],
-            )
-            logger.info(f"用户画像已更新: {user_id}")
-        except Exception as ex:
-            logger.warning(f"更新用户画像失败: {ex}")
+                await asyncio.to_thread(
+                    self._profile.add,
+                    ids=[doc_id],
+                    documents=[doc_text],
+                    metadatas=[{
+                        "user_id": user_id,
+                        "conv_id": conv_id,
+                        "updated_at": datetime.now().isoformat(),
+                    }],
+                )
+                logger.info(f"用户画像已更新: {user_id}")
+            except Exception as ex:
+                logger.warning(f"更新用户画像失败: {ex}")
 
     # ── 读取 ──────────────────────────────────────────────────────────────────
 
@@ -272,9 +287,12 @@ class MemoryManager:
         text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in to_compress))
         prompt = self._safe_text(f"用 2-3 句话总结以下对话的关键信息：\n{text}")
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
+            resp = await asyncio.wait_for(
+                self._client.messages.create(
+                    model=self._model, max_tokens=256, temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+                timeout=self._llm_timeout_s(),
             )
             summary = self._safe_text(extract_text_content(resp.content)).strip()
         except Exception:
@@ -463,11 +481,14 @@ class MemoryManager:
 """
         )
         try:
-            resp = await self._client.messages.create(
-                model=self._model,
-                max_tokens=256,
-                temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
+            resp = await asyncio.wait_for(
+                self._client.messages.create(
+                    model=self._model,
+                    max_tokens=256,
+                    temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+                timeout=self._llm_timeout_s(),
             )
             merged = self._safe_text(extract_text_content(resp.content)).strip()
             if merged:

@@ -45,8 +45,13 @@ cp .env.example .env
 
 ```env
 ANTHROPIC_API_KEY=your_api_key
-REDIS_PASSWORD=echomind123
+ECHOMIND_API_KEY=请替换为随机高强度值
+REDIS_PASSWORD=请替换为随机高强度值
+ECHOMIND_CORS_ORIGINS=http://localhost:3000,http://localhost:5173
 ```
+
+生产环境还会校验 `X-API-Key` 请求头；`ECHOMIND_LLM_TIMEOUT_S`（默认 45 秒）和
+`ECHOMIND_MAX_TOOL_ROUNDS`（默认 3 轮）用于限制单次请求的 LLM/工具调用预算。
 
 ### 3. 启动服务
 
@@ -84,7 +89,7 @@ docker compose logs -f echomind
 流程是：
 
 ```text
-读取记忆 -> 意图识别 -> 知识检索 -> Agent 路由 -> 回复生成 -> 写回记忆
+读取记忆 -> 意图识别 -> Agent 路由 -> Agent 按策略调用 RAG Tool -> 回复生成 -> 写回记忆
 ```
 
 ### 知识库
@@ -128,7 +133,8 @@ data/                       持久化数据
   -> /chat
   -> MemoryManager 读取工作记忆、情景记忆、用户画像
   -> IntentRecognizer 输出 intent / intent_group / urgency / entities
-  -> 按意图决定是否检索知识库
+  -> AgentOrchestrator 按意图和 Agent 白名单决定是否调用 search_knowledge_base
+  -> 工具层执行查询改写、召回、去重、重排，并把结果回传给 Agent
   -> AgentOrchestrator 路由到 General / Technical / Billing / Escalation
   -> Skills 注入、工具调用、回复生成
   -> 写回 Redis 和 ChromaDB

@@ -194,6 +194,7 @@ def test_tool_use_round_trip_executes_only_whitelisted_tool():
     response = asyncio.run(agent.handle(make_request()))
 
     assert response.success is True
+    assert response.tools_attempted == ["lookup_error_code"]
     assert response.tools_used == ["lookup_error_code"]
     assert len(client.calls) == 2
     assert {tool["name"] for tool in client.calls[0]["tools"]} == {

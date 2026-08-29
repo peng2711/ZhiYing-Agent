@@ -32,6 +32,7 @@ from anthropic import AsyncAnthropic
 
 from agents.tools import (
     AgentToolSpec,
+    RAG_REQUIRED_INTENTS,
     build_shared_rag_tools,
     billing_tools,
     escalation_tools,
@@ -117,6 +118,7 @@ class AgentResponse:
     confidence:  float = 1.0
     latency_ms:  float = 0.0
     escalate:    bool  = False   # 是否需要升级
+    tools_attempted: List[str] = field(default_factory=list)
     tools_used:  List[str] = field(default_factory=list)
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -147,6 +149,7 @@ class OrchestratorResult:
     agent_types: List[AgentType] = field(default_factory=list)
     primary_agent: Optional[AgentType] = None
     supporting_agents: List[AgentType] = field(default_factory=list)
+    tools_attempted: List[str] = field(default_factory=list)
     tools_used: List[str] = field(default_factory=list)
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
     routing_reason: str = ""
@@ -191,6 +194,7 @@ class BaseAgent:
         self._model  = self.profile.model or model
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
+        self._last_tools_attempted: List[str] = []
         self._last_tools_used: List[str] = []
         self._last_tool_traces: List[Dict[str, Any]] = []
         self._shared_tools: Dict[str, AgentToolSpec] = {}
@@ -205,6 +209,7 @@ class BaseAgent:
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
+        self._last_tools_attempted = []
         self._last_tools_used = []
         self._last_tool_traces = []
         try:
@@ -219,6 +224,7 @@ class BaseAgent:
                 success=True,
                 latency_ms=ms,
                 escalate=escalate,
+                tools_attempted=list(self._last_tools_attempted),
                 tools_used=list(self._last_tools_used),
                 tool_traces=list(self._last_tool_traces),
             )
@@ -231,6 +237,7 @@ class BaseAgent:
                 content="抱歉，处理您的请求时出现问题，请稍后重试。",
                 success=False,
                 latency_ms=ms,
+                tools_attempted=list(self._last_tools_attempted),
                 tool_traces=list(self._last_tool_traces),
             )
 
@@ -253,9 +260,17 @@ class BaseAgent:
         messages.append({"role": "user", "content": _clean(req.message)})
 
         tools = self.get_tools()
+        max_rounds = max(1, min(_env_int("ECHOMIND_MAX_TOOL_ROUNDS", 3), 8))
+        llm_timeout = max(1.0, _env_float("ECHOMIND_LLM_TIMEOUT_S", 45.0))
+        rag_required = (
+            req.intent is not None
+            and getattr(req.intent, "value", req.intent) in RAG_REQUIRED_INTENTS
+            and "search_knowledge_base" in tools
+        )
         tools_used: List[str] = []
+        tools_attempted: List[str] = []
         tool_traces: List[Dict[str, Any]] = []
-        for _ in range(3):
+        for round_idx in range(max_rounds):
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
                 "max_tokens": self.profile.max_tokens,
@@ -272,9 +287,22 @@ class BaseAgent:
                     }
                     for spec in tools.values()
                 ]
-            resp = await self._client.messages.create(**request_kwargs)
+                # 对政策/账单/故障事实类意图，首轮强制走知识库工具；后续轮次恢复自动选择。
+                if rag_required and round_idx == 0:
+                    request_kwargs["tool_choice"] = {
+                        "type": "tool",
+                        "name": "search_knowledge_base",
+                    }
+            resp = await asyncio.wait_for(
+                self._client.messages.create(**request_kwargs),
+                timeout=llm_timeout,
+            )
             tool_uses = [block for block in (resp.content or []) if self._block_type(block) == "tool_use"]
             if not tool_uses:
+                if rag_required and round_idx == 0:
+                    # 事实类意图不能在首轮绕过知识库，否则模型可能凭常识编造政策。
+                    raise RuntimeError("事实类意图未调用 search_knowledge_base")
+                self._last_tools_attempted = tools_attempted
                 self._last_tools_used = tools_used
                 return extract_text_content(resp.content)
 
@@ -284,6 +312,7 @@ class BaseAgent:
                 name = self._block_value(block, "name")
                 tool_use_id = self._block_value(block, "id")
                 args = self._block_value(block, "input") or {}
+                tools_attempted.append(str(name))
                 spec = tools.get(name)
                 tool_t0 = time.monotonic()
                 call_success = True
@@ -299,9 +328,12 @@ class BaseAgent:
                         result = spec.handler(req, args)
                         if inspect.isawaitable(result):
                             result = await result
-                        tools_used.append(name)
                         if isinstance(result, dict) and "success" in result:
                             result_success = bool(result.get("success"))
+                        else:
+                            result_success = True
+                        if result_success:
+                            tools_used.append(name)
                     except Exception as ex:
                         call_success = False
                         logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
@@ -316,7 +348,7 @@ class BaseAgent:
                         "tool_name": name,
                         "tool_use_id": tool_use_id,
                         "input": dict(args),
-                        "success": call_success,
+                        "success": call_success and result_success is not False,
                         "result_success": result_success,
                         "latency_ms": round(tool_latency_ms, 1),
                         "cached": bool(result.get("cached")) if isinstance(result, dict) else False,
@@ -331,6 +363,7 @@ class BaseAgent:
                 })
             messages.append({"role": "user", "content": tool_results})
 
+        self._last_tools_attempted = tools_attempted
         self._last_tools_used = tools_used
         self._last_tool_traces = tool_traces
         raise RuntimeError(f"{self.agent_type.value} 工具调用超过最大轮数")
@@ -713,6 +746,7 @@ class AgentOrchestrator:
             "intent": result.intent.value if result.intent else None,
             "primary_agent": result.primary_agent.value if result.primary_agent else None,
             "supporting_agents": [agent.value for agent in result.supporting_agents],
+            "tools_attempted": list(result.tools_attempted),
             "tools_used": list(result.tools_used),
             "tool_calls": list(result.tool_traces),
             "escalated": result.escalated,
@@ -793,6 +827,7 @@ class AgentOrchestrator:
             agent_types=[response.agent_type],
             primary_agent=decision.primary_agent,
             supporting_agents=[],
+            tools_attempted=list(response.tools_attempted),
             tools_used=list(response.tools_used),
             tool_traces=list(response.tool_traces),
             routing_reason=decision.reason,
@@ -819,6 +854,11 @@ class AgentOrchestrator:
             for response in valid_responses
             for tool_name in response.tools_used
         ))
+        tools_attempted = list(dict.fromkeys(
+            tool_name
+            for response in valid_responses
+            for tool_name in response.tools_attempted
+        ))
         tool_traces = [
             trace
             for response in valid_responses
@@ -837,6 +877,7 @@ class AgentOrchestrator:
             ] or agent_types,
             primary_agent=decision.primary_agent,
             supporting_agents=decision.supporting_agents,
+            tools_attempted=tools_attempted,
             tools_used=tools_used,
             tool_traces=tool_traces,
             routing_reason=decision.reason,

@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -163,9 +164,18 @@ class IntentRecognizer:
         self._embedding_enabled = True
 
         self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
+        self._embedding_lock = asyncio.Lock()
         self._cache: Dict[str, IntentResult] = {}
         self.cache_hits   = 0
         self.cache_misses = 0
+
+    @staticmethod
+    def _llm_timeout_s() -> float:
+        """读取统一的 LLM 超时配置，配置错误时使用安全默认值。"""
+        try:
+            return max(1.0, float(os.getenv("ECHOMIND_LLM_TIMEOUT_S", "45")))
+        except (TypeError, ValueError):
+            return 45.0
 
     # ── 公开接口 ──────────────────────────────────────────────────────────────
 
@@ -266,11 +276,14 @@ class IntentRecognizer:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await self.client.messages.create(
-                model=self.model,
-                max_tokens=256,
-                temperature=0.1,
-                messages=[{"role": "user", "content": prompt}],
+            resp = await asyncio.wait_for(
+                self.client.messages.create(
+                    model=self.model,
+                    max_tokens=256,
+                    temperature=0.1,
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+                timeout=self._llm_timeout_s(),
             )
             raw = extract_text_content(resp.content)
             s, e = raw.find("{"), raw.rfind("}") + 1
@@ -390,17 +403,18 @@ class IntentRecognizer:
 
     async def _load_template_embeddings(self) -> None:
         """懒加载所有模板的 Embedding（只在首次调用时执行）。"""
-        missing = [cat for cat in _TEMPLATES if cat not in self._tpl_embeddings]
-        if not missing:
-            return
+        async with self._embedding_lock:
+            missing = [cat for cat in _TEMPLATES if cat not in self._tpl_embeddings]
+            if not missing:
+                return
 
-        all_texts = [t for cat in missing for t in _TEMPLATES[cat]]
-        vecs = [await self._embed_text(text) for text in all_texts]
-        idx = 0
-        for cat in missing:
-            n = len(_TEMPLATES[cat])
-            self._tpl_embeddings[cat] = vecs[idx: idx + n]
-            idx += n
+            all_texts = [t for cat in missing for t in _TEMPLATES[cat]]
+            vecs = [await self._embed_text(text) for text in all_texts]
+            idx = 0
+            for cat in missing:
+                n = len(_TEMPLATES[cat])
+                self._tpl_embeddings[cat] = vecs[idx: idx + n]
+                idx += n
 
     async def _embed_text(self, text: str) -> List[float]:
         """
@@ -451,7 +465,8 @@ class IntentRecognizer:
         return UrgencyLevel.LOW
 
     def _cache_key(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-        payload = {"message": self._clean_text(message)[:200]}
+        # 不能只取前 200 字，否则长消息前缀相同会命中错误意图缓存。
+        payload = {"message": self._clean_text(message)}
         if history:
             payload["history"] = [
                 {
