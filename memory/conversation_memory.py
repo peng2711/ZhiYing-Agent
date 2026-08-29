@@ -146,8 +146,13 @@ class MemoryManager:
         role:    MsgRole,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
+        persist_long_term: bool = True,
     ) -> None:
-        """将一条消息写入工作记忆，超阈值时自动压缩。"""
+        """将一条消息写入工作记忆，超阈值时自动压缩。
+
+        persist_long_term=False 时仍保留 Redis 短期记忆和摘要，但不把压缩内容
+        写入 ChromaDB 情景记忆，适用于未明确同意长期记忆的访客用户。
+        """
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
         clean_metadata = {
@@ -170,7 +175,7 @@ class MemoryManager:
 
             # 超过压缩阈值时触发压缩，避免同进程并发请求重复重写列表。
             if await self._redis.llen(key) >= self.COMPRESS_AT:
-                await self._compress(user_id, conv_id)
+                await self._compress(user_id, conv_id, persist_long_term=persist_long_term)
 
     async def update_profile(self, user_id: str, conv_id: str) -> None:
         """
@@ -233,11 +238,18 @@ class MemoryManager:
 
     # ── 读取 ──────────────────────────────────────────────────────────────────
 
-    async def get_context(self, user_id: str, conv_id: str, query: str = "") -> MemoryContext:
+    async def get_context(
+        self,
+        user_id: str,
+        conv_id: str,
+        query: str = "",
+        include_long_term: bool = True,
+    ) -> MemoryContext:
         """
         构建完整的记忆上下文。
 
         query 用于从情景记忆中检索语义相关的历史片段。
+        include_long_term=False 时只返回当前会话的 Redis 工作记忆和摘要。
         """
         # 1. 工作记忆（当前会话最近消息）
         user_id = self._safe_text(user_id)
@@ -247,14 +259,16 @@ class MemoryManager:
         recent = await self._get_working_memory(user_id, conv_id)
 
         # 2. 情景记忆（跨会话语义检索）
-        history = await self._search_episodic(
-            user_id,
-            conv_id,
-            query or (recent[-1].content if recent else ""),
-        )
+        history = []
+        if include_long_term:
+            history = await self._search_episodic(
+                user_id,
+                conv_id,
+                query or (recent[-1].content if recent else ""),
+            )
 
         # 3. 用户画像
-        profile = await self._get_profile(user_id)
+        profile = await self._get_profile(user_id) if include_long_term else {}
 
         # 4. 会话摘要（如果已压缩过）
         summary = await self._redis.get(self._summary_key(user_id, conv_id)) or ""
@@ -268,7 +282,7 @@ class MemoryManager:
 
     # ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
 
-    async def _compress(self, user_id: str, conv_id: str) -> None:
+    async def _compress(self, user_id: str, conv_id: str, persist_long_term: bool = True) -> None:
         """
         工作记忆压缩：
           1. 用 LLM 对旧消息生成摘要
@@ -304,8 +318,9 @@ class MemoryManager:
         new_summary = await self._merge_summary(old_summary, summary)
         await self._redis.setex(skey, 86400, new_summary)
 
-        # 旧消息存入情景记忆
-        await self._store_episodic(user_id, conv_id, text, summary)
+        # 未经同意的访客只保留 Redis 短期摘要，不写入长期情景记忆。
+        if persist_long_term:
+            await self._store_episodic(user_id, conv_id, text, summary)
 
         # 重置工作记忆为最近 5 条
         key = self._wm_key(user_id, conv_id)

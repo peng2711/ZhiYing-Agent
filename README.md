@@ -53,6 +53,13 @@ ECHOMIND_CORS_ORIGINS=http://localhost:3000,http://localhost:5173
 生产环境还会校验 `X-API-Key` 请求头；`ECHOMIND_LLM_TIMEOUT_S`（默认 45 秒）和
 `ECHOMIND_MAX_TOOL_ROUNDS`（默认 3 轮）用于限制单次请求的 LLM/工具调用预算。
 
+未登录用户不会共用 `anonymous`：`/chat` 会通过 HttpOnly Cookie 签发独立的 `guest_id`。
+访客只保留当前会话的短期记忆；接入真实认证后，认证用户才启用长期情景记忆和用户画像。
+
+接入统一认证网关时，由网关传入 `X-Authenticated-User`，并用 `ECHOMIND_USER_ID_SECRET`
+对用户 ID 做 HMAC-SHA256 后放入 `X-Authenticated-User-Signature`。服务端验签成功后才使用
+该用户 ID；未验签请求仍按访客处理。
+
 ### 3. 启动服务
 
 推荐直接启动全栈：

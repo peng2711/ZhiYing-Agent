@@ -5,10 +5,12 @@ EchoMind 智能客服系统 — FastAPI 入口
 所有核心组件在 lifespan 中初始化，通过环境变量配置。
 """
 import asyncio
+import hashlib
 import hmac
 import logging
 import os
 import pathlib
+import re
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -199,6 +201,10 @@ app = FastAPI(
 
 
 _PUBLIC_PATHS = {"/health", "/docs", "/redoc", "/openapi.json", "/metrics"}
+_GUEST_COOKIE = "echomind_guest_id"
+_GUEST_COOKIE_MAX_AGE = 30 * 24 * 60 * 60
+_AUTH_USER_HEADER = "X-Authenticated-User"
+_AUTH_SIGNATURE_HEADER = "X-Authenticated-User-Signature"
 _PLACEHOLDER_API_KEYS = {
     "xxx", "your_api_key", "your-key", "replace-with-a-long-random-key",
 }
@@ -207,6 +213,9 @@ _PLACEHOLDER_API_KEYS = {
 @app.middleware("http")
 async def api_key_guard(request: FastAPIRequest, call_next):
     """可选 API Key 鉴权；生产环境未配置密钥时拒绝业务请求。"""
+    # CORS 预检请求不会携带业务 API Key，交给 CORSMiddleware 处理。
+    if request.method == "OPTIONS":
+        return await call_next(request)
     path = request.url.path.rstrip("/") or "/"
     configured = os.getenv("ECHOMIND_API_KEY", "").strip()
     if configured.lower() in _PLACEHOLDER_API_KEYS:
@@ -222,17 +231,75 @@ async def api_key_guard(request: FastAPIRequest, call_next):
             if not hmac.compare_digest(provided, configured):
                 return Response("Unauthorized", status_code=401)
 
+        identity_error = _authenticate_user_header(request)
+        if identity_error is not None:
+            return identity_error
+
     return await call_next(request)
+
+
+def _valid_guest_id(value: Optional[str]) -> bool:
+    """只接受服务端签发格式，避免把任意 Cookie 内容直接用于 Redis/Chroma 键。"""
+    return bool(value and re.fullmatch(r"guest_[0-9a-f]{32}", value))
+
+
+def _valid_authenticated_user_id(value: Optional[str]) -> bool:
+    """限制认证网关传入的用户 ID，避免控制字符进入存储键和日志。"""
+    return bool(value and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}", value))
+
+
+def _authenticate_user_header(request: FastAPIRequest) -> Optional[Response]:
+    """验签上游认证网关传入的用户身份；返回错误响应表示请求应被拒绝。"""
+    user_id = request.headers.get(_AUTH_USER_HEADER, "").strip()
+    signature = request.headers.get(_AUTH_SIGNATURE_HEADER, "").strip().lower()
+    if not user_id and not signature:
+        return None
+    if not user_id or not signature or not _valid_authenticated_user_id(user_id):
+        return Response("Invalid authenticated user headers", status_code=401)
+
+    secret = os.getenv("ECHOMIND_USER_ID_SECRET", "").strip()
+    if secret.lower() in {"", "xxx", "your_secret", "replace-with-a-random-secret"}:
+        if os.getenv("APP_ENV", "development").lower() == "production":
+            return Response("ECHOMIND_USER_ID_SECRET 未配置", status_code=503)
+        return None
+
+    expected = hmac.new(secret.encode("utf-8"), user_id.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return Response("Invalid authenticated user signature", status_code=401)
+    request.state.authenticated_user_id = user_id
+    return None
+
+
+def _resolve_chat_identity(request: FastAPIRequest, requested_user_id: str) -> tuple[str, bool, bool]:
+    """返回 (memory_user_id, is_guest, newly_issued_guest_id)。
+
+    body.user_id 仅为兼容旧客户端，默认不可信；生产环境应由真正的登录 Token
+    中间件设置 request.state.authenticated_user_id 后再接入真实账号。
+    """
+    authenticated_user_id = getattr(request.state, "authenticated_user_id", None)
+    if authenticated_user_id:
+        return str(authenticated_user_id), False, False
+
+    allow_client_id = os.getenv("ECHOMIND_ALLOW_CLIENT_USER_ID", "false").lower() in {"1", "true", "yes"}
+    if allow_client_id and requested_user_id and requested_user_id != "anonymous":
+        return requested_user_id, False, False
+
+    guest_id = request.cookies.get(_GUEST_COOKIE)
+    if _valid_guest_id(guest_id):
+        return guest_id, True, False
+    return f"guest_{uuid.uuid4().hex}", True, True
 
 _cors_origins = [origin.strip() for origin in os.getenv(
     "ECHOMIND_CORS_ORIGINS", "http://localhost:3000,http://localhost:5173"
 ).split(",") if origin.strip()]
 if os.getenv("APP_ENV", "development").lower() != "production" and not _cors_origins:
     _cors_origins = ["*"]
+_cors_allow_credentials = "*" not in _cors_origins
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
+    allow_credentials=_cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -241,7 +308,12 @@ app.add_middleware(
 # ── 请求/响应模型 ─────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message:     str = Field(min_length=1, max_length=8000)
-    user_id:     str = Field(default="anonymous", min_length=1, max_length=128)
+    user_id:     str = Field(
+        default="anonymous",
+        min_length=1,
+        max_length=128,
+        description="兼容旧客户端的字段；默认不作为身份依据，服务端使用 guest_id Cookie",
+    )
     conv_id:     Optional[str] = Field(default=None, min_length=1, max_length=128)
 
 
@@ -305,7 +377,7 @@ async def reload_skills():
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, response: Response, request: FastAPIRequest):
     """
     主对话接口。完整流程：
       记忆读取 → 意图识别 → Agent 路由 → 执行 → 记忆写入
@@ -316,10 +388,29 @@ async def chat(req: ChatRequest):
     from agents.agent_orchestrator import Request as OrcReq
     from memory.conversation_memory import MsgRole
 
+    memory_user_id, is_guest, newly_issued_guest_id = _resolve_chat_identity(request, req.user_id)
+    if newly_issued_guest_id:
+        secure_cookie = os.getenv("APP_ENV", "development").lower() == "production"
+        response.set_cookie(
+            key=_GUEST_COOKIE,
+            value=memory_user_id,
+            max_age=_GUEST_COOKIE_MAX_AGE,
+            httponly=True,
+            secure=secure_cookie,
+            samesite="lax",
+        )
+    # 匿名访客只保留短期记忆；只有认证用户（或明确开启旧兼容模式）才写长期记忆。
+    persist_long_term = not is_guest
+
     conv_id = req.conv_id or str(uuid.uuid4())
 
     # 1. 读取记忆上下文
-    mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
+    mem_ctx = await _memory.get_context(
+        memory_user_id,
+        conv_id,
+        query=req.message,
+        include_long_term=persist_long_term,
+    )
 
     # 2. 构建编排请求（含对话历史，用于意图识别上下文）
     history = [
@@ -333,7 +424,7 @@ async def chat(req: ChatRequest):
 
     orch_req = OrcReq(
         message=req.message,
-        user_id=req.user_id,
+        user_id=memory_user_id,
         conv_id=conv_id,
         context=full_context,
         history=history,
@@ -348,11 +439,18 @@ async def chat(req: ChatRequest):
     result = await _orchestrator.run(orch_req)
 
     # 4. 写入记忆
-    await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
-    await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
+    await _memory.add_message(
+        memory_user_id, conv_id, MsgRole.USER, req.message,
+        persist_long_term=persist_long_term,
+    )
+    await _memory.add_message(
+        memory_user_id, conv_id, MsgRole.ASSISTANT, result.response,
+        persist_long_term=persist_long_term,
+    )
 
     # 5. 异步更新用户画像（不阻塞响应）
-    asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
+    if persist_long_term:
+        asyncio.create_task(_memory.update_profile(memory_user_id, conv_id))
 
     return ChatResponse(
         conv_id=conv_id,
