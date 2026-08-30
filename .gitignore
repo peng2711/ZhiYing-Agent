@@ -1,38 +1,42 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-.venv/
-venv/
-
-# 环境变量（含敏感信息）
+# Secrets and local configuration
 .env
 .env.*
 !.env.example
+*.pem
+*.key
 
-# 数据目录
-data/
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+
+# Runtime data
+data/chroma/
+data/eval/
 logs/
+*.sqlite3
+*.db
 
-# IDE
+# IDE and OS
 .idea/
 .vscode/
+.DS_Store
+Thumbs.db
 *.swp
 *.swo
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Docker 构建产物
-build-image*.sh
-
-# ChromaDB 本地数据
-*.sqlite3
-
-# 备份文件
-*~
+# Temporary files
+*.log
+*.tmp
 *.bak
-docker-compose(1).yml
+*~

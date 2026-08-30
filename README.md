@@ -1,182 +1,216 @@
-# EchoMind
+<div align="center">
 
-EchoMind 是一个面向客服/运营场景的多 Agent 智能系统。它不是单纯的聊天机器人，而是把以下能力串成闭环：
+# 知应 Agent
 
-- 细粒度意图识别
-- 路由驱动的多 Agent 编排
-- 意图驱动 RAG 检索
-- Redis + ChromaDB 分层记忆
-- 动态 Skills 注入
-- 在线监控与路由降权
-- LLM-as-Judge 端到端评测
+**基于多 Agent、RAG 与分层记忆的智能客服平台**
 
-## 你可以先看什么
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Vue](https://img.shields.io/badge/Vue-3-42b883?logo=vuedotjs&logoColor=white)](https://vuejs.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![License](https://img.shields.io/badge/License-MIT-pink.svg)](LICENSE)
 
-- [技术亮点](wiki/技术亮点.md)
-- [重点代码](wiki/重点代码.md)
-- [业务流程说明](wiki/业务流程说明.md)
-- [完整使用指南](wiki/完整使用指南.md)
+</div>
 
-## 快速开始
+知应 Agent（ZhiYing Agent）是一个面向中文客服场景的开源 Agent 应用。系统通过细粒度意图识别将请求路由给专业 Agent，由 Agent 按需调用 RAG 工具，并将路由、工具输入、耗时和知识引用呈现在可观测工作台中。
 
-### 1. 准备环境
+> 当前默认适配 DeepSeek 原生 OpenAI-compatible API。项目中的客服规则和知识内容均为演示数据，不连接真实订单、支付或工单系统。
 
-- Docker
-- Docker Compose
-- `ANTHROPIC_API_KEY`
+## 效果展示
 
-如果使用兼容 Anthropic 协议的第三方模型服务，也可以配置：
+![知应 Agent 对话与运行追踪工作台](docs/assets/zhiying-agent-console.png)
+
+工作台包含对话、知识库管理和自动化评测三个视图。对话页可以同时查看意图、主 Agent、路由置信度、RAG 工具输入、响应耗时和运行告警。
+
+## 核心能力
+
+- **多 Agent 路由**：General、Technical、Billing、Escalation 四类专业 Agent。
+- **细粒度意图识别**：融合 LLM、字符 n-gram 相似度和关键词规则，覆盖退款、发票、物流、登录故障等意图。
+- **Agent Tool Use**：政策类和故障类问题可强制调用知识库，避免模型绕过数据源直接回答。
+- **RAG 知识库**：支持文档添加、文件上传、切片、向量检索、查询改写、缓存与重排。
+- **分层记忆**：Redis 保存会话工作记忆，ChromaDB 保存情景记忆和用户画像。
+- **可观测链路**：记录请求 ID、路由结果、工具输入、缓存状态、重排状态和耗时。
+- **自动化评测**：提供意图识别评测、LLM-as-Judge 回复评测和回归基线。
+- **动态 Skills**：业务规则以 Markdown Skill 维护，运行时按 Agent 注入。
+
+## 请求链路
+
+```mermaid
+flowchart LR
+    U[用户请求] --> M[读取会话记忆]
+    M --> I[意图识别]
+    I --> R[Agent 路由]
+    R --> G[General Agent]
+    R --> T[Technical Agent]
+    R --> B[Billing Agent]
+    R --> E[Escalation Agent]
+    G --> TOOL[RAG / 业务工具]
+    T --> TOOL
+    B --> TOOL
+    E --> TOOL
+    TOOL --> LLM[生成回复]
+    LLM --> W[写回记忆与 Trace]
+    W --> U
+```
+
+| Agent | 主要职责 | 示例问题 |
+|---|---|---|
+| GeneralAgent | 通用咨询、订单与物流分诊 | “订单什么时候发货？” |
+| TechnicalAgent | 登录、错误码和系统故障排查 | “登录一直提示 401” |
+| BillingAgent | 退款、发票、支付与扣款 | “我要申请退款” |
+| EscalationAgent | 人工升级和交接摘要 | “请转人工客服” |
+
+复合问题可以并行派发给多个 Agent，再由 `ResponseComposer` 合并为一条统一回复。更完整的设计说明见 [架构文档](docs/architecture.md)。
+
+## 技术栈
+
+- 后端：Python、FastAPI、Anthropic SDK、OpenAI SDK
+- 模型：DeepSeek 原生 API（可切换 Anthropic-compatible 客户端）
+- 数据：Redis、ChromaDB
+- 前端：Vue 3、Vite
+- 监控：Prometheus Client、自定义运行告警
+- 工程化：Pytest、GitHub Actions、Docker Compose
+
+## 本地启动
+
+### 1. 环境要求
+
+- Python 3.11+
+- Node.js 22+
+- Redis 7（短期记忆需要）
+- DeepSeek API Key
+
+ChromaDB 服务不是本地启动的硬性要求：连接失败时，后端会回退到本地持久化模式。首次使用本地模式时可能下载默认向量模型。
+
+### 2. 启动后端
+
+```powershell
+cd backend
+Copy-Item .env.example .env
+```
+
+编辑 `backend/.env`，至少填写：
 
 ```env
-ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
-ANTHROPIC_MODEL=deepseek-v4-pro
-ANTHROPIC_API_KEY=your_key
+LLM_API_KEY=your_deepseek_api_key
+LLM_MODEL=deepseek-v4-pro
+LLM_BASE_URL=https://api.deepseek.com
+LLM_PROVIDER=deepseek_openai
+DEEPSEEK_THINKING=disabled
 ```
 
-### 2. 配置环境变量
+安装依赖并启动：
 
-复制示例配置：
+```powershell
+conda create -n zhiying python=3.11 -y
+conda activate zhiying
+pip install -r requirements-dev.txt
+python -m uvicorn api.main:app --reload --port 8000
+```
+
+健康检查：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+```
+
+### 3. 启动前端
+
+打开另一个终端：
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+访问：
+
+- 前端工作台：<http://127.0.0.1:5173>
+- Swagger API：<http://127.0.0.1:8000/docs>
+
+### 4. 导入示例知识
+
+后端启动后，可以导入仓库内的公开演示知识：
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8000/knowledge/add `
+  -ContentType 'application/json; charset=utf-8' `
+  -InFile ./backend/examples/knowledge.json
+```
+
+## Docker Compose
+
+复制并填写配置：
 
 ```bash
-cp .env.example .env
+cp backend/.env.example backend/.env
+docker compose up --build
 ```
 
-最少确认这些变量可用：
+启动后访问 `http://localhost:5173`。Compose 会同时启动前端、后端、Redis 和 ChromaDB。
 
-```env
-ANTHROPIC_API_KEY=your_api_key
-ECHOMIND_API_KEY=请替换为随机高强度值
-REDIS_PASSWORD=请替换为随机高强度值
-ECHOMIND_CORS_ORIGINS=http://localhost:3000,http://localhost:5173
-```
-
-生产环境还会校验 `X-API-Key` 请求头；`ECHOMIND_LLM_TIMEOUT_S`（默认 45 秒）和
-`ECHOMIND_MAX_TOOL_ROUNDS`（默认 3 轮）用于限制单次请求的 LLM/工具调用预算。
-
-未登录用户不会共用 `anonymous`：`/chat` 会通过 HttpOnly Cookie 签发独立的 `guest_id`。
-访客只保留当前会话的短期记忆；接入真实认证后，认证用户才启用长期情景记忆和用户画像。
-
-接入统一认证网关时，由网关传入 `X-Authenticated-User`，并用 `ECHOMIND_USER_ID_SECRET`
-对用户 ID 做 HMAC-SHA256 后放入 `X-Authenticated-User-Signature`。服务端验签成功后才使用
-该用户 ID；未验签请求仍按访客处理。
-
-### 3. 启动服务
-
-推荐直接启动全栈：
+## API 示例
 
 ```bash
-docker compose up -d --build
+curl -X POST http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message":"我想申请退款，订单号是 #12345","user_id":"demo-user"}'
 ```
 
-查看状态：
+主要接口：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/chat` | 对话、意图识别、Agent 路由和工具调用 |
+| `POST` | `/search` | 直接测试知识检索链路 |
+| `POST` | `/knowledge/add` | 批量添加知识文档 |
+| `POST` | `/knowledge/upload` | 上传 JSON、Markdown 或文本文件 |
+| `GET` | `/knowledge/stats` | 查看知识库统计 |
+| `GET` | `/trace/tool/{request_id}` | 查看单次工具调用 Trace |
+| `GET` | `/monitor` | 查看 Agent 和工具运行指标 |
+| `POST` | `/eval/run` | 执行端到端评测 |
+| `GET` | `/skills` | 查看已加载的 Skills |
+
+## 测试与构建
 
 ```bash
-docker compose ps
+cd backend
+python -m pytest -q
+
+cd ../frontend
+npm ci
+npm run build
 ```
-
-看日志：
-
-```bash
-docker compose logs -f echomind
-```
-
-### 4. 访问入口
-
-- API: `http://localhost:8000`
-- Swagger: `http://localhost:8000/docs`
-- Nginx: `http://localhost`
-- Health: `http://localhost:8000/health`
-
-## 核心功能
-
-### 对话主链路
-
-`POST /chat`
-
-流程是：
-
-```text
-读取记忆 -> 意图识别 -> Agent 路由 -> Agent 按策略调用 RAG Tool -> 回复生成 -> 写回记忆
-```
-
-### 知识库
-
-- `POST /search`
-- `POST /knowledge/add`
-- `POST /knowledge/upload`
-- `GET /knowledge/stats`
-
-### Skills
-
-- `GET /skills`
-- `POST /skills/reload`
-
-### 监控与评测
-
-- `GET /monitor`
-- `POST /eval/run`
 
 ## 项目结构
 
 ```text
-api/main.py                  FastAPI 入口
-agents/agent_orchestrator.py 多 Agent 编排
-core/intent_recognizer.py    三路融合意图识别
-core/skill_loader.py         动态 Skills 加载
-memory/conversation_memory.py  Redis + ChromaDB 记忆
-mcp/tool_manager.py          工具层、缓存、熔断、重排
-mcp/knowledge_base.py        ChromaDB 知识库
-monitor/performance_monitor.py 在线监控
-evaluation/evaluator.py      端到端评测
-wiki/                       详细文档
-skills/                     动态业务规则
-data/                       持久化数据
+ZhiYing-Agent/
+├── backend/
+│   ├── agents/          # Agent 定义、路由与工具循环
+│   ├── api/             # FastAPI 接口
+│   ├── core/            # 意图识别、LLM 适配与 Skills
+│   ├── mcp/             # 工具管理和 RAG 知识库
+│   ├── memory/          # Redis + ChromaDB 分层记忆
+│   ├── monitor/         # 指标和告警
+│   ├── evaluation/      # 自动化评测
+│   ├── skills/          # 可动态加载的业务规则
+│   ├── examples/        # 可公开导入的演示知识
+│   └── tests/
+├── frontend/            # Vue 3 可观测工作台
+├── docs/                # 架构文档和效果图
+└── docker-compose.yml
 ```
 
-## 运行时架构
+## 安全说明
 
-```text
-用户请求
-  -> /chat
-  -> MemoryManager 读取工作记忆、情景记忆、用户画像
-  -> IntentRecognizer 输出 intent / intent_group / urgency / entities
-  -> AgentOrchestrator 按意图和 Agent 白名单决定是否调用 search_knowledge_base
-  -> 工具层执行查询改写、召回、去重、重排，并把结果回传给 Agent
-  -> AgentOrchestrator 路由到 General / Technical / Billing / Escalation
-  -> Skills 注入、工具调用、回复生成
-  -> 写回 Redis 和 ChromaDB
-  -> Monitor 采集在线指标
-  -> Evaluator 做意图识别和回复质量评测
-```
+- 不要提交 `backend/.env`、API Key、Cookie、真实用户数据或本地数据库。
+- `user_id` 默认不被视为可信身份；未认证访客使用服务端签发的独立 Cookie。
+- 生产环境请配置 `ZHIYING_API_KEY`、`ZHIYING_USER_ID_SECRET`、HTTPS 和受保护的 Redis/ChromaDB。
+- 演示规则不应直接用于真实退款、支付或账户操作。
 
-## 主要端口
+## License
 
-| 服务 | 端口 |
-|---|---:|
-| EchoMind API | 8000 |
-| ChromaDB | 8001 |
-| Redis | 6379 |
-| Prometheus | 9090 |
-| Nginx | 80 |
-
-## 开发和调试
-
-常用顺序：
-
-```text
-1. /health
-2. /chat
-3. /skills
-4. /monitor
-5. /eval/run
-```
-
-如果你只想看项目怎么工作，直接读：
-
-- [EchoMind定位与技术亮点](wiki/EchoMind定位与技术亮点.md)
-- [技术亮点](wiki/技术亮点.md)
-- [重点代码](wiki/重点代码.md)
-
-## 一句话概括
-
-EchoMind 是一个可观测、可评测、可降级的多 Agent 客服运行时。
+本项目使用 [MIT License](LICENSE)。
