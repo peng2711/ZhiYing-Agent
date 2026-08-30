@@ -492,26 +492,64 @@ class EndToEndEvaluator:
         )
 
 
-# ── 内置测试用例（开箱即用）──────────────────────────────────────────────────
+# ── 公开评测集（开箱即用）────────────────────────────────────────────────────
 
-DEFAULT_INTENT_CASES: List[IntentTestCase] = [
-    IntentTestCase("我的订单什么时候到？",       "logistics"),
-    IntentTestCase("帮我取消订单",               "request"),
-    IntentTestCase("你们服务太差了！",            "complaint"),
-    IntentTestCase("应用一直报500错误",           "technical_crash"),
-    IntentTestCase("为什么扣了两次款？",          "payment_issue"),
-    IntentTestCase("我要投诉，转人工！",          "human_handoff"),
-    IntentTestCase("你好",                        "greeting"),
-    IntentTestCase("修改我的邮箱地址",            "account"),
-    IntentTestCase("帮我开发票",                  "invoice"),
-    IntentTestCase("退款多久到账？",              "refund"),
-    IntentTestCase("登录一直报401",               "technical_login"),
+_DATASET_DIR = pathlib.Path(__file__).with_name("datasets")
+_FALLBACK_INTENT_CASES = [
+    {"message": "我的订单什么时候到？", "expected_intent": "logistics"},
+    {"message": "帮我开发票", "expected_intent": "invoice"},
+    {"message": "退款多久到账？", "expected_intent": "refund"},
+    {"message": "登录一直报 401", "expected_intent": "technical_login"},
 ]
-
-DEFAULT_DIALOG_CASES: List[Dict[str, Any]] = [
+_FALLBACK_DIALOG_CASES = [
     {"question": "我的订单 #12345 还没到，已经超时了"},
-    {"question": "应用登录一直报错 401"},
-    {"question": "为什么这个月多扣了 50 块钱？"},
-    {"question": "帮我把收货地址改成北京市朝阳区"},
     {"turns": ["你好，我想退款", "订单号是 #12345", "退款多久能到账？"]},
 ]
+
+
+def _load_dataset_json(filename: str, fallback: Any) -> Any:
+    """读取仓库中的公开评测集；文件缺失或格式错误时使用最小兜底集。"""
+    path = _DATASET_DIR / filename
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else fallback
+    except (OSError, json.JSONDecodeError, TypeError):
+        logger.warning("评测集加载失败，使用兜底数据: %s", path)
+        return fallback
+
+
+def load_intent_cases(path: Optional[str] = None) -> List[IntentTestCase]:
+    """加载意图评测集，也支持通过路径注入自定义数据集。"""
+    source = pathlib.Path(path) if path else _DATASET_DIR / "intent_cases.json"
+    try:
+        data = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        data = _load_dataset_json("intent_cases.json", _FALLBACK_INTENT_CASES)
+    cases = []
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict) or not item.get("message") or not item.get("expected_intent"):
+            continue
+        cases.append(IntentTestCase(
+            message=str(item["message"]),
+            expected_intent=str(item["expected_intent"]),
+            context=item.get("context") if isinstance(item.get("context"), dict) else None,
+        ))
+    return cases or [IntentTestCase(**item) for item in _FALLBACK_INTENT_CASES]
+
+
+def load_dialog_cases(path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """加载单轮/多轮对话评测集，也支持通过路径注入自定义数据集。"""
+    source = pathlib.Path(path) if path else _DATASET_DIR / "dialog_cases.json"
+    try:
+        data = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        data = _load_dataset_json("dialog_cases.json", _FALLBACK_DIALOG_CASES)
+    valid = []
+    for item in data if isinstance(data, list) else []:
+        if isinstance(item, dict) and (item.get("question") or item.get("turns")):
+            valid.append(item)
+    return valid or list(_FALLBACK_DIALOG_CASES)
+
+
+DEFAULT_INTENT_CASES: List[IntentTestCase] = load_intent_cases()
+DEFAULT_DIALOG_CASES: List[Dict[str, Any]] = load_dialog_cases()

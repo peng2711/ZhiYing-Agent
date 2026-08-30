@@ -61,6 +61,15 @@ flowchart LR
 
 复合问题可以并行派发给多个 Agent，再由 `ResponseComposer` 合并为一条统一回复。更完整的设计说明见 [架构文档](docs/architecture.md)。
 
+## Agent 评测集
+
+公开评测数据位于 `backend/evaluation/datasets/`：
+
+- `intent_cases.json`：120 条中文意图分类样本，覆盖 12 个核心类别，每类 10 条。
+- `dialog_cases.json`：20 组单轮和多轮对话样本，其中包含退款、发票、物流、支付异常、登录故障和复合问题。
+
+运行 `POST /eval/run` 时默认加载这两份数据。意图评测输出 Accuracy、Macro-F1 和分类型结果；对话评测由 LLM-as-Judge 输出相关性、准确性、完整性、可执行性和综合得分，并与历史 baseline 做回归比较。数据集是可扩展的 JSON 格式，也可以通过接口提交自定义用例。
+
 ## 技术栈
 
 - 后端：Python、FastAPI、Anthropic SDK、OpenAI SDK
@@ -196,6 +205,7 @@ ZhiYing-Agent/
 │   ├── memory/          # Redis + ChromaDB 分层记忆
 │   ├── monitor/         # 指标和告警
 │   ├── evaluation/      # 自动化评测
+│   │   └── datasets/     # 公开意图与对话评测集
 │   ├── skills/          # 可动态加载的业务规则
 │   ├── examples/        # 可公开导入的演示知识
 │   └── tests/

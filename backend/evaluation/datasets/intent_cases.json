@@ -1,0 +1,482 @@
+[
+  {
+    "message": "快递现在到哪一步了？",
+    "expected_intent": "logistics"
+  },
+  {
+    "message": "物流信息一天没更新了怎么办？",
+    "expected_intent": "logistics"
+  },
+  {
+    "message": "请问包裹预计什么时候送到？",
+    "expected_intent": "logistics"
+  },
+  {
+    "message": "我的运单怎么一直显示运输中？",
+    "expected_intent": "logistics"
+  },
+  {
+    "message": "配送大概需要几天？",
+    "expected_intent": "logistics"
+  },
+  {
+    "message": "能帮我查一下快递进度吗？",
+    "expected_intent": "logistics"
+  },
+  {
+    "message": "订单已经发货但我还没收到物流通知",
+    "expected_intent": "logistics"
+  },
+  {
+    "message": "偏远地区配送会不会更慢？",
+    "expected_intent": "logistics"
+  },
+  {
+    "message": "同城订单今天能送到吗？",
+    "expected_intent": "logistics"
+  },
+  {
+    "message": "我想知道包裹的预计到达时间",
+    "expected_intent": "logistics"
+  },
+  {
+    "message": "帮我查订单目前是什么状态",
+    "expected_intent": "order_status"
+  },
+  {
+    "message": "订单支付成功了吗？",
+    "expected_intent": "order_status"
+  },
+  {
+    "message": "我的订单有没有发货？",
+    "expected_intent": "order_status"
+  },
+  {
+    "message": "订单现在处理到哪一步了？",
+    "expected_intent": "order_status"
+  },
+  {
+    "message": "订单号对应的状态怎么查看？",
+    "expected_intent": "order_status"
+  },
+  {
+    "message": "我想确认一下这笔订单是否已完成",
+    "expected_intent": "order_status"
+  },
+  {
+    "message": "订单一直停留在待支付是什么情况？",
+    "expected_intent": "order_status"
+  },
+  {
+    "message": "可以告诉我订单有没有签收吗？",
+    "expected_intent": "order_status"
+  },
+  {
+    "message": "订单显示已完成但我没有收到货",
+    "expected_intent": "order_status"
+  },
+  {
+    "message": "请查询一下我的订单进度",
+    "expected_intent": "order_status"
+  },
+  {
+    "message": "我不想要了，怎么申请退款？",
+    "expected_intent": "refund"
+  },
+  {
+    "message": "退款申请提交后多久能到账？",
+    "expected_intent": "refund"
+  },
+  {
+    "message": "商品有质量问题可以退吗？",
+    "expected_intent": "refund"
+  },
+  {
+    "message": "我想办理退货退款",
+    "expected_intent": "refund"
+  },
+  {
+    "message": "退款为什么还没有原路返回？",
+    "expected_intent": "refund"
+  },
+  {
+    "message": "超过七天还能申请退款吗？",
+    "expected_intent": "refund"
+  },
+  {
+    "message": "能帮我看看这笔订单是否支持退款吗？",
+    "expected_intent": "refund"
+  },
+  {
+    "message": "退货之后什么时候能收到退款？",
+    "expected_intent": "refund"
+  },
+  {
+    "message": "我需要取消这笔购买并退款",
+    "expected_intent": "refund"
+  },
+  {
+    "message": "退款审核一般需要多长时间",
+    "expected_intent": "refund"
+  },
+  {
+    "message": "电子发票在哪里申请？",
+    "expected_intent": "invoice"
+  },
+  {
+    "message": "发票抬头填错了怎么修改？",
+    "expected_intent": "invoice"
+  },
+  {
+    "message": "购买后多久可以开具发票？",
+    "expected_intent": "invoice"
+  },
+  {
+    "message": "企业发票需要提供哪些信息？",
+    "expected_intent": "invoice"
+  },
+  {
+    "message": "请把这笔订单开成增值税发票",
+    "expected_intent": "invoice"
+  },
+  {
+    "message": "发票会发送到哪个邮箱？",
+    "expected_intent": "invoice"
+  },
+  {
+    "message": "已经付款的订单可以补开发票吗？",
+    "expected_intent": "invoice"
+  },
+  {
+    "message": "开发票需要填写纳税人识别号吗？",
+    "expected_intent": "invoice"
+  },
+  {
+    "message": "我想查看之前开过的电子发票",
+    "expected_intent": "invoice"
+  },
+  {
+    "message": "退款订单还能继续开票吗？",
+    "expected_intent": "invoice"
+  },
+  {
+    "message": "为什么同一笔订单扣了两次钱？",
+    "expected_intent": "payment_issue"
+  },
+  {
+    "message": "支付失败但银行卡已经扣款了",
+    "expected_intent": "payment_issue"
+  },
+  {
+    "message": "页面金额和实际扣款不一致",
+    "expected_intent": "payment_issue"
+  },
+  {
+    "message": "我被多收了五十元怎么办？",
+    "expected_intent": "payment_issue"
+  },
+  {
+    "message": "付款一直显示处理中",
+    "expected_intent": "payment_issue"
+  },
+  {
+    "message": "优惠券没有抵扣成功，金额不对",
+    "expected_intent": "payment_issue"
+  },
+  {
+    "message": "银行卡扣款成功但订单还是待支付",
+    "expected_intent": "payment_issue"
+  },
+  {
+    "message": "支付时提示余额不足但余额明明够",
+    "expected_intent": "payment_issue"
+  },
+  {
+    "message": "如何核对这笔支付记录？",
+    "expected_intent": "payment_issue"
+  },
+  {
+    "message": "我想查询一笔异常扣款",
+    "expected_intent": "payment_issue"
+  },
+  {
+    "message": "登录时一直提示401",
+    "expected_intent": "technical_login"
+  },
+  {
+    "message": "验证码一直收不到怎么办？",
+    "expected_intent": "technical_login"
+  },
+  {
+    "message": "账号密码正确却无法登录",
+    "expected_intent": "technical_login"
+  },
+  {
+    "message": "登录页面提示认证失败",
+    "expected_intent": "technical_login"
+  },
+  {
+    "message": "我换了设备后登录不上了",
+    "expected_intent": "technical_login"
+  },
+  {
+    "message": "登录令牌过期怎么处理？",
+    "expected_intent": "technical_login"
+  },
+  {
+    "message": "第三方授权登录失效了",
+    "expected_intent": "technical_login"
+  },
+  {
+    "message": "登录接口返回403错误",
+    "expected_intent": "technical_login"
+  },
+  {
+    "message": "忘记密码后无法完成重置",
+    "expected_intent": "technical_login"
+  },
+  {
+    "message": "系统一直把我踢回登录页",
+    "expected_intent": "technical_login"
+  },
+  {
+    "message": "应用打开就闪退",
+    "expected_intent": "technical_crash"
+  },
+  {
+    "message": "页面加载时报500错误",
+    "expected_intent": "technical_crash"
+  },
+  {
+    "message": "系统运行几分钟后崩溃",
+    "expected_intent": "technical_crash"
+  },
+  {
+    "message": "客户端一直卡死没有响应",
+    "expected_intent": "technical_crash"
+  },
+  {
+    "message": "接口请求频繁超时",
+    "expected_intent": "technical_crash"
+  },
+  {
+    "message": "升级后程序无法启动",
+    "expected_intent": "technical_crash"
+  },
+  {
+    "message": "网页打开是一片空白",
+    "expected_intent": "technical_crash"
+  },
+  {
+    "message": "服务端出现异常错误怎么办？",
+    "expected_intent": "technical_crash"
+  },
+  {
+    "message": "应用报错后自动退出",
+    "expected_intent": "technical_crash"
+  },
+  {
+    "message": "我需要排查系统崩溃问题",
+    "expected_intent": "technical_crash"
+  },
+  {
+    "message": "我想修改绑定邮箱",
+    "expected_intent": "account"
+  },
+  {
+    "message": "如何更换账户手机号？",
+    "expected_intent": "account"
+  },
+  {
+    "message": "请帮我更新个人资料",
+    "expected_intent": "account"
+  },
+  {
+    "message": "我想注销当前账户",
+    "expected_intent": "account"
+  },
+  {
+    "message": "账户昵称可以修改吗？",
+    "expected_intent": "account"
+  },
+  {
+    "message": "怎么设置新的登录密码？",
+    "expected_intent": "account"
+  },
+  {
+    "message": "我要修改默认收货信息",
+    "expected_intent": "account"
+  },
+  {
+    "message": "个人信息页面打不开",
+    "expected_intent": "account"
+  },
+  {
+    "message": "如何查看账户安全设置？",
+    "expected_intent": "account"
+  },
+  {
+    "message": "我想变更账户的通知方式",
+    "expected_intent": "account"
+  },
+  {
+    "message": "这次服务让我很不满意",
+    "expected_intent": "complaint"
+  },
+  {
+    "message": "你们处理问题太慢了",
+    "expected_intent": "complaint"
+  },
+  {
+    "message": "我对客服的回复很失望",
+    "expected_intent": "complaint"
+  },
+  {
+    "message": "等了很久都没有人处理",
+    "expected_intent": "complaint"
+  },
+  {
+    "message": "这个结果完全不能接受",
+    "expected_intent": "complaint"
+  },
+  {
+    "message": "服务质量太差了",
+    "expected_intent": "complaint"
+  },
+  {
+    "message": "为什么一直没人跟进我的问题？",
+    "expected_intent": "complaint"
+  },
+  {
+    "message": "我要投诉这次服务",
+    "expected_intent": "complaint"
+  },
+  {
+    "message": "你们的处理方式很不专业",
+    "expected_intent": "complaint"
+  },
+  {
+    "message": "我已经反复反馈很多次了",
+    "expected_intent": "complaint"
+  },
+  {
+    "message": "我要转人工客服",
+    "expected_intent": "human_handoff"
+  },
+  {
+    "message": "请帮我升级给人工处理",
+    "expected_intent": "human_handoff"
+  },
+  {
+    "message": "我想找客服主管",
+    "expected_intent": "human_handoff"
+  },
+  {
+    "message": "这个问题需要专员介入",
+    "expected_intent": "human_handoff"
+  },
+  {
+    "message": "能安排人工跟进吗？",
+    "expected_intent": "human_handoff"
+  },
+  {
+    "message": "我要提交人工工单",
+    "expected_intent": "human_handoff"
+  },
+  {
+    "message": "请不要再让我和机器人沟通了",
+    "expected_intent": "human_handoff"
+  },
+  {
+    "message": "帮我联系二线支持",
+    "expected_intent": "human_handoff"
+  },
+  {
+    "message": "我需要人工审核退款",
+    "expected_intent": "human_handoff"
+  },
+  {
+    "message": "请把这个问题转交给负责人",
+    "expected_intent": "human_handoff"
+  },
+  {
+    "message": "帮我取消订单",
+    "expected_intent": "request"
+  },
+  {
+    "message": "我需要修改收货地址",
+    "expected_intent": "request"
+  },
+  {
+    "message": "请协助我提交申请",
+    "expected_intent": "request"
+  },
+  {
+    "message": "帮我查询一下这项服务",
+    "expected_intent": "request"
+  },
+  {
+    "message": "我想变更订单信息",
+    "expected_intent": "request"
+  },
+  {
+    "message": "请帮我处理这笔业务",
+    "expected_intent": "request"
+  },
+  {
+    "message": "能不能替我发起退款申请",
+    "expected_intent": "request"
+  },
+  {
+    "message": "我需要补充订单资料",
+    "expected_intent": "request"
+  },
+  {
+    "message": "请告诉我下一步怎么操作",
+    "expected_intent": "request"
+  },
+  {
+    "message": "帮我确认一下提交要求",
+    "expected_intent": "request"
+  },
+  {
+    "message": "你好",
+    "expected_intent": "greeting"
+  },
+  {
+    "message": "嗨，能帮我吗？",
+    "expected_intent": "greeting"
+  },
+  {
+    "message": "您好",
+    "expected_intent": "greeting"
+  },
+  {
+    "message": "早上好",
+    "expected_intent": "greeting"
+  },
+  {
+    "message": "晚上好",
+    "expected_intent": "greeting"
+  },
+  {
+    "message": "有人在线吗？",
+    "expected_intent": "greeting"
+  },
+  {
+    "message": "你好呀",
+    "expected_intent": "greeting"
+  },
+  {
+    "message": "很高兴见到你",
+    "expected_intent": "greeting"
+  },
+  {
+    "message": "请问这里是客服吗？",
+    "expected_intent": "greeting"
+  },
+  {
+    "message": "在吗？",
+    "expected_intent": "greeting"
+  }
+]

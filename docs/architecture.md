@@ -73,6 +73,8 @@ DeepSeek Thinking Mode 默认关闭，因为当前链路会对事实型意图强
 
 ## 可观测与评测
 
+仓库提供一套可直接运行的公开评测集：120 条意图分类样本和 20 组单轮/多轮对话样本，分别位于 `backend/evaluation/datasets/intent_cases.json` 与 `dialog_cases.json`。新增样本只需按现有 JSON 字段追加，不需要修改评测代码。
+
 每次请求生成 `request_id`，Trace 记录：
 
 - 意图和主 Agent

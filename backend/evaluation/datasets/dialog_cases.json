@@ -1,0 +1,142 @@
+[
+  {
+    "id": "logistics_01",
+    "question": "我的包裹已经发货三天了，物流为什么还没有更新？",
+    "expected_intent": "logistics"
+  },
+  {
+    "id": "logistics_02",
+    "question": "请问标准配送一般需要几个工作日？",
+    "expected_intent": "logistics"
+  },
+  {
+    "id": "order_01",
+    "question": "订单 #A20260830 现在是已支付还是已发货？",
+    "expected_intent": "order_status"
+  },
+  {
+    "id": "refund_01",
+    "question": "商品有质量问题，我想申请退款。",
+    "expected_intent": "refund"
+  },
+  {
+    "id": "invoice_01",
+    "question": "付款后多久可以收到电子发票？",
+    "expected_intent": "invoice"
+  },
+  {
+    "id": "payment_01",
+    "question": "银行卡已经扣款，但订单仍然显示待支付。",
+    "expected_intent": "payment_issue"
+  },
+  {
+    "id": "login_01",
+    "question": "登录时提示 401，应该如何排查？",
+    "expected_intent": "technical_login"
+  },
+  {
+    "id": "crash_01",
+    "question": "应用启动后马上闪退，我需要提供哪些信息？",
+    "expected_intent": "technical_crash"
+  },
+  {
+    "id": "account_01",
+    "question": "我要修改账户绑定的手机号。",
+    "expected_intent": "account"
+  },
+  {
+    "id": "handoff_01",
+    "question": "这个问题比较紧急，请直接转人工客服。",
+    "expected_intent": "human_handoff"
+  },
+  {
+    "id": "refund_02",
+    "turns": [
+      "你好，我想申请退款",
+      "订单号是 #A12345，商品还没有发货",
+      "请问审核通过后多久到账？"
+    ],
+    "expected_intent": "refund"
+  },
+  {
+    "id": "invoice_02",
+    "turns": [
+      "我需要开发票",
+      "订单号是 #B20260830",
+      "抬头是北京知应科技有限公司，税号需要填在哪里？"
+    ],
+    "expected_intent": "invoice"
+  },
+  {
+    "id": "logistics_03",
+    "turns": [
+      "我的订单什么时候到？",
+      "订单号是 #C10086",
+      "页面显示已发货，但两天没有物流信息"
+    ],
+    "expected_intent": "logistics"
+  },
+  {
+    "id": "payment_02",
+    "turns": [
+      "我发现被重复扣款了",
+      "两笔扣款都是 99 元，时间相差一分钟",
+      "请告诉我接下来需要提供哪些凭证"
+    ],
+    "expected_intent": "payment_issue"
+  },
+  {
+    "id": "login_02",
+    "turns": [
+      "我无法登录账号",
+      "验证码一直收不到",
+      "我已经确认手机号没有更换"
+    ],
+    "expected_intent": "technical_login"
+  },
+  {
+    "id": "crash_02",
+    "turns": [
+      "系统最近经常崩溃",
+      "主要发生在提交订单时",
+      "错误提示是 500，其他页面暂时正常"
+    ],
+    "expected_intent": "technical_crash"
+  },
+  {
+    "id": "account_02",
+    "turns": [
+      "我想注销账户",
+      "账户里还有一笔未完成订单",
+      "请问应该先处理订单还是可以直接注销？"
+    ],
+    "expected_intent": "account"
+  },
+  {
+    "id": "handoff_02",
+    "turns": [
+      "我要投诉这次服务",
+      "我已经等待了两天还没有处理",
+      "请帮我整理信息并转给人工主管"
+    ],
+    "expected_intent": "human_handoff"
+  },
+  {
+    "id": "mixed_01",
+    "turns": [
+      "登录一直报 401，而且我刚刚被扣了两次款",
+      "登录问题可以先告诉我排查步骤",
+      "扣款问题也请说明需要核验哪些信息"
+    ],
+    "expected_intent": "technical_login"
+  },
+  {
+    "id": "mixed_02",
+    "turns": [
+      "我想退款并申请发票",
+      "订单已经支付但还没有发货",
+      "请分别告诉我退款和开票的处理条件"
+    ],
+    "expected_intent": "refund"
+  }
+]
