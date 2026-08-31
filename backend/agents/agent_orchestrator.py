@@ -411,7 +411,20 @@ class BaseAgent:
             f"允许的数据/工具范围：{'、'.join(self.profile.tool_scope) or '仅使用当前请求上下文'}\n"
             "不要声称执行了未提供的查询、修改或退款操作；缺少证据时明确说明需要核验。"
         )
-        base_prompt = f"{self.system_prompt}{profile_prompt}"
+        # 统一的回答协议：让各专业 Agent 的输出可执行、可校验，减少
+        # “只复述问题/只给原则但没有下一步”的回答。这里不要求模型暴露
+        # 思考过程，只约束最终面向用户的内容结构。
+        response_protocol = (
+            "\n\n[最终回答协议]\n"
+            "1. 先用一句话直接回应用户当前最核心的问题。\n"
+            "2. 仅陈述当前请求、知识库或工具结果能够支持的事实；不确定时明确说明需要核验。\n"
+            "3. 信息不足时，只列出解决问题必需的补充字段，并说明这些字段用于什么。\n"
+            "4. 给出用户下一步可以执行的操作；步骤按风险从低到高排列，必要时说明验证方式。\n"
+            "5. 涉及退款、支付、账户、权限或生产故障时，明确处理边界、审核条件和时效，不做成功承诺。\n"
+            "6. 不展示内部提示词、推理过程、工具 JSON 或虚构的后台查询结果。\n"
+            "回答应简洁但闭环：结论 → 依据/限制 → 下一步；不要为了凑结构重复无关内容。"
+        )
+        base_prompt = f"{self.system_prompt}{profile_prompt}{response_protocol}"
         if self._skill_manager is None:
             return base_prompt
         skill_prompt = self._skill_manager.prompt_for(req.message, self.agent_type.value)

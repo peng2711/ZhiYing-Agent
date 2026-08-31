@@ -18,3 +18,5 @@ def test_public_dialog_dataset_contains_single_and_multi_turn_cases():
     assert sum("question" in case for case in DEFAULT_DIALOG_CASES) >= 10
     assert sum(isinstance(case.get("turns"), list) and len(case["turns"]) >= 2 for case in DEFAULT_DIALOG_CASES) >= 10
     assert all(case.get("question") or case.get("turns") for case in DEFAULT_DIALOG_CASES)
+    # 对话用例带有期望意图，评测器会将其用于路由轨迹校验。
+    assert all(case.get("expected_intent") for case in DEFAULT_DIALOG_CASES)

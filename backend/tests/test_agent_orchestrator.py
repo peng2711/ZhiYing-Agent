@@ -69,6 +69,15 @@ def test_domain_agents_build_different_role_packets():
     assert general_packet != technical_packet != billing_packet
 
 
+def test_agent_system_prompt_contains_executable_response_protocol():
+    agent = BillingAgent(FakeClient(), "test-model")
+    prompt = agent._build_system_prompt(make_request(intent=IntentCategory.REFUND))
+
+    assert "最终回答协议" in prompt
+    assert "结论 → 依据/限制 → 下一步" in prompt
+    assert "不做成功承诺" in prompt
+
+
 def test_escalation_agent_is_a_real_non_llm_handoff_node():
     client = FakeClient()
     agent = EscalationAgent(client, "test-model")

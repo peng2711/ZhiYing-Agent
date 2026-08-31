@@ -274,7 +274,8 @@ class EndToEndEvaluator:
         """
         results: List[EvalResult] = []
         all_scores: Dict[str, List[float]] = {
-            "relevance": [], "accuracy": [], "completeness": [], "helpfulness": []
+            "relevance": [], "accuracy": [], "completeness": [], "helpfulness": [],
+            "dialog_intent_match": [],
         }
 
         # 1. 意图识别评测
@@ -305,9 +306,7 @@ class EndToEndEvaluator:
                             all_scores[k].append(r.scores[k])
 
         # 3. 汇总
-        avg_scores = {
-            k: round(statistics.mean(v), 4) for k, v in all_scores.items() if v
-        }
+        avg_scores = {k: round(statistics.mean(v), 4) for k, v in all_scores.items() if v}
         if intent_metrics:
             avg_scores["intent_accuracy"] = intent_metrics["accuracy"]
 
@@ -346,6 +345,7 @@ class EndToEndEvaluator:
 
         conv_id = str(case.get("conv_id") or f"eval_{case_idx}")
         user_id = str(case.get("user_id") or "eval_user")
+        expected_intent = str(case.get("expected_intent") or "").strip()
         history: List[Dict[str, str]] = []
         results: List[EvalResult] = []
 
@@ -362,7 +362,17 @@ class EndToEndEvaluator:
             actual_answer = orch_result.response
 
             scores = await self._judge.judge(question, actual_answer, context=context or None)
-            passed = not scores.judge_failed and scores.overall >= self.PASS_THRESHOLD
+            actual_intent = orch_result.intent.value if orch_result.intent else ""
+            intent_match = (
+                1.0 if not expected_intent else float(actual_intent == expected_intent)
+            )
+            # 对数据集提供了 expected_intent 的用例，把路由正确性纳入端到端
+            # 通过条件。只看最终文本会掩盖“答得像但路由错了”的 Agent 回归。
+            passed = (
+                not scores.judge_failed
+                and scores.overall >= self.PASS_THRESHOLD
+                and intent_match >= 1.0
+            )
 
             history.append({"role": "user", "content": question})
             history.append({"role": "assistant", "content": actual_answer})
@@ -377,6 +387,7 @@ class EndToEndEvaluator:
                     "completeness": scores.completeness,
                     "helpfulness": scores.helpfulness,
                     "overall": scores.overall,
+                    "intent_match": intent_match,
                 },
                 detail=f"Q: {question[:30]}... → 综合评分 {scores.overall:.3f}",
                 metadata={
@@ -384,6 +395,8 @@ class EndToEndEvaluator:
                     "response": actual_answer,
                     "agent_type": orch_result.agent_type.value,
                     "intent": orch_result.intent.value if orch_result.intent else None,
+                    "expected_intent": expected_intent or None,
+                    "intent_match": bool(intent_match),
                     "turn": turn_idx,
                     "conv_id": conv_id,
                     "judge_failed": scores.judge_failed,
@@ -432,11 +445,13 @@ class EndToEndEvaluator:
         recs = []
         if scores.get("intent_accuracy", 1.0) < 0.90:
             recs.append("意图识别准确率 < 90%：增加 Few-shot 示例，或对低 F1 的意图类别补充训练数据")
-        if scores.get("relevance", 1.0) < 0.75:
+        if scores.get("dialog_intent_match", 1.0) < 0.90:
+            recs.append("对话路由命中率 < 90%：检查多轮上下文、细粒度意图边界和低置信度澄清策略")
+        if scores.get("relevance", 1.0) < 0.80:
             recs.append("相关性偏低：检查 Agent system_prompt，确保 Agent 聚焦于用户问题")
-        if scores.get("completeness", 1.0) < 0.75:
+        if scores.get("completeness", 1.0) < 0.80:
             recs.append("完整性偏低：Agent 可能过早结束回答，考虑在 prompt 中要求提供完整解决方案")
-        if scores.get("helpfulness", 1.0) < 0.75:
+        if scores.get("helpfulness", 1.0) < 0.80:
             recs.append("有用性偏低：回答可能过于抽象，考虑要求 Agent 提供具体操作步骤")
         if not recs:
             recs.append("所有指标均达标，继续保持")

@@ -69,14 +69,14 @@ class IntentResult:
 
 # ── Few-shot 模板（同时用于 LLM 示例和 Embedding 匹配）────────────────────────
 _TEMPLATES: Dict[IntentCategory, List[str]] = {
-    IntentCategory.QUERY:      ["我的订单状态是什么？", "如何重置密码？", "快递什么时候到？"],
+    IntentCategory.QUERY:      ["在哪里查看服务说明？", "我想了解一下处理进度", "这个功能怎么用？"],
     IntentCategory.COMPLAINT:  ["等了好几个小时！", "服务太差了！", "一直没人处理！"],
-    IntentCategory.REQUEST:    ["帮我取消订单", "我需要修改地址", "请协助退款"],
+    IntentCategory.REQUEST:    ["帮我修改昵称", "请协助提交资料", "我要关闭这项通知"],
     IntentCategory.GREETING:   ["你好", "嗨，有人吗", "早上好"],
     IntentCategory.ESCALATION: ["我要投诉！", "转人工客服", "找你们经理"],
-    IntentCategory.TECHNICAL:  ["应用一直崩溃", "无法登录", "出现500错误"],
-    IntentCategory.BILLING:    ["为什么扣了两次款？", "申请退款", "发票问题"],
-    IntentCategory.ACCOUNT:    ["修改邮箱", "注销账户", "更新个人信息"],
+    IntentCategory.TECHNICAL:  ["页面加载很慢", "接口响应异常", "配置应该怎么设置？"],
+    IntentCategory.BILLING:    ["我想查看账单明细", "费用明细在哪里看？", "本月账单需要核对"],
+    IntentCategory.ACCOUNT:    ["修改个人资料", "注销账户", "更新账户信息"],
     IntentCategory.FEEDBACK:   ["服务很棒！", "非常满意", "给个好评"],
     IntentCategory.ORDER_STATUS: ["我的订单现在是什么状态？", "订单有没有发货？", "订单处理到哪一步了？"],
     IntentCategory.LOGISTICS: ["快递什么时候到？", "物流一直不更新", "配送要多久？"],
@@ -88,6 +88,17 @@ _TEMPLATES: Dict[IntentCategory, List[str]] = {
     IntentCategory.TECHNICAL_CRASH: ["应用一直崩溃", "页面报500错误", "系统闪退"],
     IntentCategory.HUMAN_HANDOFF: ["转人工客服", "我要找人工", "请升级处理"],
 }
+
+# 细粒度类别的边界提示，供 LLM 在相邻意图之间做对比判断。通用类别不应
+# 抢走已经能落到业务细分类别的请求；只有信息确实不足时才使用 generic/other。
+_INTENT_BOUNDARIES = (
+    "order_status=订单当前状态或是否发货；logistics=运输、配送、物流轨迹或送达时间；"
+    "refund=退款/退货申请或退款到账；invoice=开票、抬头、税号、电子发票；"
+    "payment_issue=支付失败、扣款异常、重复扣款或已扣款但订单未支付；"
+    "technical_login=登录、认证、验证码、401/403；technical_crash=崩溃、闪退、500 或页面异常；"
+    "account_security=被盗、异常登录、密码/安全设置；human_handoff=明确要求人工或升级；"
+    "complaint=表达不满但没有明确业务处理目标；request=请求执行非上述细分业务的操作。"
+)
 
 _SPECIFIC_INTENTS = {
     IntentCategory.ORDER_STATUS,
@@ -251,7 +262,7 @@ class IntentRecognizer:
         examples = "\n".join(
             f'  消息: "{t}" → 意图: {cat.value}'
             for cat, tpls in _TEMPLATES.items()
-            for t in tpls[:1]  # 每类取 1 条，控制 prompt 长度
+            for t in tpls[:2]  # 每类取 2 条，兼顾覆盖度和上下文长度
         )
         # 最近 3 轮对话上下文
         ctx = ""
@@ -264,6 +275,10 @@ class IntentRecognizer:
         prompt = f"""你是客服意图分析专家。根据示例判断用户意图，返回 JSON。
 如果用户问题能匹配细粒度业务意图，请优先返回细粒度意图，而不是宽泛大类。
 例如退款优先返回 refund，发票优先返回 invoice，登录故障优先返回 technical_login。
+不要因为出现“帮我/怎么/问题”等通用词就选择 request/query/technical/billing/account；
+先依据真正的业务目标和错误现象判断。只能从可选意图中选择一个，置信度要反映不确定性。
+
+意图边界：{_INTENT_BOUNDARIES}
 
         {ctx}
         用户消息: "{message}"
