@@ -372,7 +372,8 @@ class BaseAgent:
                                     if not isinstance(item, dict) or item.get("fallback"):
                                         continue
                                     citation = {key: item.get(key) for key in
-                                        ("source_id", "document_name", "title", "version", "updated_at", "section", "chunk", "content", "score")
+                                        ("source_id", "document_name", "title", "version", "updated_at", "section",
+                                         "status", "effective_from", "effective_to", "chunk", "content", "score")
                                         if item.get(key) is not None}
                                     if citation and citation not in citations:
                                         citations.append(citation)

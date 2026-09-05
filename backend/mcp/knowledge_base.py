@@ -14,7 +14,7 @@ ChromaDB 在这里的角色：
 import asyncio
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import chromadb
@@ -64,6 +64,7 @@ class KnowledgeBase:
             name=self.COLLECTION_NAME,
             metadata={"description": "ZhiYing Agent RAG 知识库"},
         )
+        self._migrate_legacy_metadata()
 
         # 如果知识库为空，导入默认文档
         if self._collection.count() == 0:
@@ -71,7 +72,7 @@ class KnowledgeBase:
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
-    def add_documents(self, documents: List[Dict[str, str]]) -> int:
+    def add_documents(self, documents: List[Dict[str, Any]]) -> int:
         """
         批量导入文档到知识库。
 
@@ -89,18 +90,33 @@ class KnowledgeBase:
             version = str(doc.get("version") or "1.0")
             updated_at = str(doc.get("updated_at") or datetime.now(timezone.utc).date().isoformat())
             section = str(doc.get("section") or title)
+            status = str(doc.get("status") or "active").lower()
+            if status not in {"active", "expired"}:
+                raise ValueError("知识库版本状态只能是 active 或 expired")
+            effective_from = self._normalize_date(
+                doc.get("effective_from"), default=date.today().isoformat()
+            )
+            effective_to = self._normalize_date(doc.get("effective_to"), default="")
+            if effective_to and effective_to < effective_from:
+                raise ValueError("effective_to 不能早于 effective_from")
+            if status == "active" and effective_from > date.today().isoformat():
+                raise ValueError("active 版本的 effective_from 不能晚于今天")
             chunks  = self._chunk_text(content, chunk_size=500)
 
-            # 同一来源重复导入应覆盖旧版本，避免旧政策和新政策同时被召回。
+            # 只覆盖同一来源的同一版本；其他版本保留，便于审计和回滚。
             try:
-                self._collection.delete(where={"source_id": source_id})
+                self._collection.delete(where={"$and": [
+                    {"source_id": source_id}, {"version": version},
+                ]})
             except Exception:
                 # 兼容历史 collection（旧切片没有 source_id 元数据）。
                 logger.debug("知识库旧版本清理跳过: source_id=%s", source_id, exc_info=True)
 
             for i, chunk in enumerate(chunks):
                 # 使用完整 chunk 生成稳定 ID，重复导入相同文档时幂等。
-                doc_id = hashlib.sha256(f"{title}\0{i}\0{chunk}".encode("utf-8")).hexdigest()
+                doc_id = hashlib.sha256(
+                    f"{source_id}\0{version}\0{title}\0{i}\0{chunk}".encode("utf-8")
+                ).hexdigest()
                 ids.append(doc_id)
                 docs.append(chunk)
                 metas.append({
@@ -110,9 +126,15 @@ class KnowledgeBase:
                     "version": version,
                     "updated_at": updated_at,
                     "section": section,
+                    "status": status,
+                    "effective_from": effective_from,
+                    "effective_to": effective_to,
                     "chunk_index": i,
                     "total_chunks": len(chunks),
                 })
+
+            if status == "active":
+                self._expire_other_versions(source_id, version, effective_from)
 
         if ids:
             # ChromaDB 会自动生成 Embedding
@@ -136,31 +158,52 @@ class KnowledgeBase:
 
         ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
         """
+        # 多取一些候选，日期过滤和同源版本选择后仍尽量满足 top_k。
+        candidate_k = min(max(top_k * 4, 20), max(self._collection.count(), 1))
         results = self._collection.query(
             query_texts=[query],
-            n_results=top_k,
+            n_results=candidate_k,
+            where={"status": "active"},
         )
 
-        items = []
+        candidates = []
+        today = date.today().isoformat()
         if results["documents"] and results["documents"][0]:
             for doc, meta, dist in zip(
                 results["documents"][0],
                 results["metadatas"][0],
                 results["distances"][0],
             ):
-                items.append({
+                effective_from = str(meta.get("effective_from", "1970-01-01"))
+                effective_to = str(meta.get("effective_to", ""))
+                if effective_from > today or (effective_to and effective_to < today):
+                    continue
+                candidates.append({
                     "title":    meta.get("title", ""),
                     "document_name": meta.get("document_name", meta.get("title", "")),
                     "source_id": meta.get("source_id", ""),
                     "version": meta.get("version", "1.0"),
                     "updated_at": meta.get("updated_at", ""),
                     "section": meta.get("section", meta.get("title", "")),
+                    "status": meta.get("status", "active"),
+                    "effective_from": effective_from,
+                    "effective_to": effective_to,
                     "content":  doc,
                     "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
                     "chunk":    meta.get("chunk_index", 0),
                 })
 
-        return items
+        # 若历史数据存在重叠 active 版本，每个 source 只保留生效日期最新的一版。
+        selected_versions: Dict[str, tuple[str, str]] = {}
+        for item in candidates:
+            source_id = item["source_id"]
+            candidate = (item["effective_from"], item["version"])
+            if source_id not in selected_versions or candidate > selected_versions[source_id]:
+                selected_versions[source_id] = candidate
+        return [
+            item for item in candidates
+            if (item["effective_from"], item["version"]) == selected_versions[item["source_id"]]
+        ][:top_k]
 
     async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """异步检索；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
@@ -173,6 +216,86 @@ class KnowledgeBase:
     async def doc_count_async(self) -> int:
         """异步获取文档片段数量。"""
         return await asyncio.to_thread(self._collection.count)
+
+    def list_versions(self, source_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """列出文档版本；每个版本只返回一条摘要，不返回重复 chunk。"""
+        kwargs: Dict[str, Any] = {"include": ["metadatas"]}
+        if source_id:
+            kwargs["where"] = {"source_id": source_id}
+        result = self._collection.get(**kwargs)
+        versions: Dict[tuple[str, str], Dict[str, Any]] = {}
+        for meta in result.get("metadatas") or []:
+            key = (str(meta.get("source_id", "")), str(meta.get("version", "1.0")))
+            item = versions.setdefault(key, {
+                "source_id": key[0], "version": key[1],
+                "document_name": meta.get("document_name", meta.get("title", "")),
+                "status": meta.get("status", "active"),
+                "effective_from": meta.get("effective_from", "1970-01-01"),
+                "effective_to": meta.get("effective_to", ""),
+                "updated_at": meta.get("updated_at", ""), "chunks": 0,
+            })
+            item["chunks"] += 1
+        return sorted(versions.values(), key=lambda item: (
+            item["source_id"], item["effective_from"], item["version"]
+        ), reverse=True)
+
+    async def list_versions_async(self, source_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self.list_versions, source_id)
+
+    def set_version_status(
+        self, source_id: str, version: str, status: str, effective_from: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """激活或停用一个版本；激活时自动停用同源的其他版本。"""
+        status = status.lower()
+        if status not in {"active", "expired"}:
+            raise ValueError("知识库版本状态只能是 active 或 expired")
+        result = self._collection.get(
+            where={"$and": [{"source_id": source_id}, {"version": version}]},
+            include=["metadatas"],
+        )
+        ids, metas = list(result.get("ids") or []), list(result.get("metadatas") or [])
+        if not ids:
+            raise KeyError(f"未找到知识库版本: {source_id}@{version}")
+        active_from = self._normalize_date(effective_from, default=date.today().isoformat())
+        if status == "active" and active_from > date.today().isoformat():
+            raise ValueError("active 版本的 effective_from 不能晚于今天")
+        if status == "active":
+            self._expire_other_versions(source_id, version, active_from)
+        updated = []
+        for meta in metas:
+            next_meta = dict(meta)
+            next_meta["status"] = status
+            if status == "active":
+                next_meta["effective_from"] = active_from
+                next_meta["effective_to"] = ""
+            else:
+                next_meta["effective_to"] = date.today().isoformat()
+            updated.append(next_meta)
+        self._collection.update(ids=ids, metadatas=updated)
+        versions = self.list_versions(source_id=source_id)
+        return next(item for item in versions if item["version"] == version)
+
+    async def set_version_status_async(
+        self, source_id: str, version: str, status: str, effective_from: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return await asyncio.to_thread(
+            self.set_version_status, source_id, version, status, effective_from
+        )
+
+    def delete_version(self, source_id: str, version: str) -> int:
+        """精确删除一个来源的一个版本，返回删除的 chunk 数。"""
+        result = self._collection.get(
+            where={"$and": [{"source_id": source_id}, {"version": version}]},
+            include=["metadatas"],
+        )
+        ids = list(result.get("ids") or [])
+        if not ids:
+            raise KeyError(f"未找到知识库版本: {source_id}@{version}")
+        self._collection.delete(ids=ids)
+        return len(ids)
+
+    async def delete_version_async(self, source_id: str, version: str) -> int:
+        return await asyncio.to_thread(self.delete_version, source_id, version)
 
     # ── MCP 工具 handler ─────────────────────────────────────────────────────
 
@@ -191,6 +314,48 @@ class KnowledgeBase:
         return await self.search_async(query, top_k=top_k)
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_date(value: Any, default: str) -> str:
+        text = str(value or default)
+        if not text:
+            return ""
+        try:
+            return date.fromisoformat(text).isoformat()
+        except ValueError as exc:
+            raise ValueError(f"无效日期 {text}，应使用 YYYY-MM-DD") from exc
+
+    def _expire_other_versions(self, source_id: str, version: str, active_from: str) -> None:
+        result = self._collection.get(where={"source_id": source_id}, include=["metadatas"])
+        ids_to_update, metas_to_update = [], []
+        expiry = (date.fromisoformat(active_from) - timedelta(days=1)).isoformat()
+        for item_id, meta in zip(result.get("ids") or [], result.get("metadatas") or []):
+            if str(meta.get("version", "1.0")) == version or meta.get("status", "active") != "active":
+                continue
+            next_meta = dict(meta)
+            next_meta["status"] = "expired"
+            next_meta["effective_to"] = expiry
+            ids_to_update.append(item_id)
+            metas_to_update.append(next_meta)
+        if ids_to_update:
+            self._collection.update(ids=ids_to_update, metadatas=metas_to_update)
+
+    def _migrate_legacy_metadata(self) -> None:
+        """为升级前没有版本生命周期字段的 chunk 补默认值。"""
+        result = self._collection.get(include=["metadatas"])
+        ids_to_update, metas_to_update = [], []
+        for item_id, meta in zip(result.get("ids") or [], result.get("metadatas") or []):
+            if all(key in meta for key in ("status", "effective_from", "effective_to")):
+                continue
+            next_meta = dict(meta)
+            next_meta.setdefault("status", "active")
+            next_meta.setdefault("effective_from", "1970-01-01")
+            next_meta.setdefault("effective_to", "")
+            ids_to_update.append(item_id)
+            metas_to_update.append(next_meta)
+        if ids_to_update:
+            self._collection.update(ids=ids_to_update, metadatas=metas_to_update)
+            logger.info("已迁移 %s 个历史知识片段的版本元数据", len(ids_to_update))
 
     def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
         """将长文本按 chunk_size 切片，保留语义完整性（按句号/换行切分）。"""

@@ -172,6 +172,18 @@ class MCPToolManager:
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
 
+    def invalidate_cache(self, name: Optional[str] = None) -> int:
+        """清理全部缓存，或只清理指定工具的缓存。知识库变更后必须调用。"""
+        if name is None:
+            count = len(self._cache)
+            self._cache.clear()
+            return count
+        prefix = f"{name}:"
+        keys = [key for key in self._cache if key.startswith(prefix)]
+        for key in keys:
+            del self._cache[key]
+        return len(keys)
+
     # ── 核心调用 ──────────────────────────────────────────────────────────────
 
     async def call(
@@ -366,15 +378,30 @@ class MCPToolManager:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 3. 合并去重（按内容哈希去重）
-        seen, merged = set(), []
+        # 3. 合并去重。RAG 同一 chunk 在不同子查询下的 score 会变化，不能直接
+        # 对整个 dict 哈希，否则会把同一证据重复返回；重复时保留最高分结果。
+        seen: Dict[str, int] = {}
+        merged = []
         for r in results:
             if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
                 for item in r.data:
-                    key = hashlib.md5(str(item).encode()).hexdigest()
+                    if isinstance(item, dict) and item.get("source_id"):
+                        identity = {
+                            "source_id": item.get("source_id"),
+                            "version": item.get("version", "1.0"),
+                            "chunk": item.get("chunk", 0),
+                        }
+                    else:
+                        identity = item
+                    key = hashlib.md5(
+                        json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str).encode()
+                    ).hexdigest()
                     if key not in seen:
-                        seen.add(key)
+                        seen[key] = len(merged)
                         merged.append(item)
+                    elif isinstance(item, dict) and isinstance(merged[seen[key]], dict):
+                        if float(item.get("score", 0) or 0) > float(merged[seen[key]].get("score", 0) or 0):
+                            merged[seen[key]] = item
 
         if not merged:
             return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无结果")

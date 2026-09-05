@@ -26,7 +26,7 @@
 - **多 Agent 路由**：General、Technical、Billing、Escalation 四类专业 Agent。
 - **细粒度意图识别**：融合 LLM、字符 n-gram 相似度和关键词规则，覆盖退款、发票、物流、登录故障等意图。
 - **Agent Tool Use**：政策类和故障类问题可强制调用知识库，避免模型绕过数据源直接回答。
-- **RAG 知识库**：支持文档添加、文件上传、切片、向量检索、查询改写、缓存与重排。
+- **RAG 知识库**：支持文档添加、版本生命周期、有效期过滤、切片、向量检索、查询改写、缓存与重排。
 - **分层记忆**：Redis 保存会话工作记忆，ChromaDB 保存情景记忆和用户画像。
 - **可观测链路**：记录请求 ID、路由结果、工具输入、缓存状态、重排状态和耗时。
 - **自动化评测**：提供意图识别评测、LLM-as-Judge 回复评测和回归基线。
@@ -202,12 +202,34 @@ curl -X POST http://127.0.0.1:8000/chat \
 | `POST` | `/knowledge/add` | 批量添加知识文档 |
 | `POST` | `/knowledge/upload` | 上传 JSON、Markdown 或文本文件 |
 | `GET` | `/knowledge/stats` | 查看知识库统计 |
+| `GET` | `/knowledge/versions` | 查看知识库版本历史，可按 `source_id` 过滤 |
+| `POST` | `/knowledge/versions/{source_id}/{version}/activate` | 激活版本并停用同源旧版本 |
+| `POST` | `/knowledge/versions/{source_id}/{version}/expire` | 停用指定版本 |
+| `DELETE` | `/knowledge/versions/{source_id}/{version}` | 精确删除指定版本 |
 | `GET` | `/trace/tool/{request_id}` | 查看单次工具调用 Trace |
 | `GET` | `/tickets/{ticket_id}` | 查询当前用户的人工工单 |
 | `POST` | `/demo/reset` | 仅开发环境恢复演示订单、退款和工单 |
 | `GET` | `/monitor` | 查看 Agent 和工具运行指标 |
 | `POST` | `/eval/run` | 执行端到端评测 |
 | `GET` | `/skills` | 查看已加载的 Skills |
+
+知识文档可以携带版本生命周期元数据：
+
+```json
+{
+  "documents": [{
+    "source_id": "refund-policy",
+    "title": "退款政策",
+    "content": "购买后 15 天内支持无理由退款。",
+    "version": "2.0",
+    "status": "active",
+    "effective_from": "2026-09-01",
+    "effective_to": null
+  }]
+}
+```
+
+同一 `source_id` 的新版本激活后，旧版本仍保留用于审计，但默认 RAG 只召回当前有效版本。版本切换会同步清理检索缓存。
 
 ## 测试与构建
 

@@ -138,7 +138,10 @@
                     <span>v{{ citation.version || '1.0' }} · chunk {{ citation.chunk ?? 0 }}</span>
                   </summary>
                   <p>{{ citation.content }}</p>
-                  <small>{{ citation.section || '-' }} · 更新于 {{ citation.updated_at || '未知' }}</small>
+                  <small>
+                    {{ citation.section || '-' }} · 更新于 {{ citation.updated_at || '未知' }}
+                    · 生效期 {{ citation.effective_from || '未设置' }} 至 {{ citation.effective_to || '长期有效' }}
+                  </small>
                 </details>
               </div>
               <div v-if="item.trace" class="message-trace">

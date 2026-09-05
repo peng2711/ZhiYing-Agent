@@ -14,7 +14,7 @@ import re
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 
 _ROOT = str(pathlib.Path(__file__).parent.parent.resolve())
@@ -584,6 +584,15 @@ class DocInput(BaseModel):
     version: str = Field(default="1.0", min_length=1, max_length=64)
     updated_at: Optional[str] = Field(default=None, max_length=64)
     section: Optional[str] = Field(default=None, max_length=256)
+    status: Literal["active", "expired"] = "active"
+    effective_from: Optional[str] = Field(
+        default=None, pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description="版本生效日期，YYYY-MM-DD；active 版本不能晚于今天",
+    )
+    effective_to: Optional[str] = Field(
+        default=None, pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description="版本失效日期，YYYY-MM-DD",
+    )
 
 
 class BatchDocInput(BaseModel):
@@ -633,9 +642,13 @@ async def add_knowledge(body: BatchDocInput):
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    count = await kb.add_documents_async([
-        d.model_dump(exclude_none=True) for d in body.documents
-    ])
+    try:
+        count = await kb.add_documents_async([
+            d.model_dump(exclude_none=True) for d in body.documents
+        ])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _tool_manager.invalidate_cache("knowledge_search")
     total = await kb.doc_count_async()
     return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": total}
 
@@ -683,7 +696,11 @@ async def upload_knowledge(file: UploadFile = File(...)):
     except Exception as ex:
         raise HTTPException(400, f"文档格式不合法: {ex}")
 
-    count = await kb.add_documents_async(docs)
+    try:
+        count = await kb.add_documents_async(docs)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _tool_manager.invalidate_cache("knowledge_search")
     total = await kb.doc_count_async()
     return {
         "message": f"文件 {filename} 导入成功",
@@ -699,7 +716,74 @@ async def knowledge_stats():
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    return {"total_chunks": await kb.doc_count_async()}
+    versions = await kb.list_versions_async()
+    return {
+        "total_chunks": await kb.doc_count_async(),
+        "total_versions": len(versions),
+        "active_versions": sum(item["status"] == "active" for item in versions),
+        "expired_versions": sum(item["status"] == "expired" for item in versions),
+    }
+
+
+@app.get("/knowledge/versions", tags=["知识库"])
+async def list_knowledge_versions(source_id: Optional[str] = Query(default=None, max_length=128)):
+    """查看全部版本，或查看指定 source_id 的版本历史。"""
+    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
+    if tool is None:
+        raise HTTPException(503, "知识库未初始化")
+    kb = tool.handler.__self__
+    return {"versions": await kb.list_versions_async(source_id)}
+
+
+@app.post("/knowledge/versions/{source_id}/{version}/activate", tags=["知识库"])
+async def activate_knowledge_version(
+    source_id: str,
+    version: str,
+    effective_from: Optional[str] = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    """激活指定版本，并自动将同一来源的其他版本标记为 expired。"""
+    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
+    if tool is None:
+        raise HTTPException(503, "知识库未初始化")
+    kb = tool.handler.__self__
+    try:
+        result = await kb.set_version_status_async(source_id, version, "active", effective_from)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _tool_manager.invalidate_cache("knowledge_search")
+    return {"message": "知识库版本已激活", "version": result}
+
+
+@app.post("/knowledge/versions/{source_id}/{version}/expire", tags=["知识库"])
+async def expire_knowledge_version(source_id: str, version: str):
+    """停用指定版本；停用后默认 RAG 检索不会再召回。"""
+    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
+    if tool is None:
+        raise HTTPException(503, "知识库未初始化")
+    kb = tool.handler.__self__
+    try:
+        result = await kb.set_version_status_async(source_id, version, "expired")
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    _tool_manager.invalidate_cache("knowledge_search")
+    return {"message": "知识库版本已停用", "version": result}
+
+
+@app.delete("/knowledge/versions/{source_id}/{version}", tags=["知识库"])
+async def delete_knowledge_version(source_id: str, version: str):
+    """精确删除指定版本；其他来源和其他版本不受影响。"""
+    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
+    if tool is None:
+        raise HTTPException(503, "知识库未初始化")
+    kb = tool.handler.__self__
+    try:
+        deleted_chunks = await kb.delete_version_async(source_id, version)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    _tool_manager.invalidate_cache("knowledge_search")
+    return {"message": "知识库版本已删除", "deleted_chunks": deleted_chunks}
 
 
 @app.post("/eval/run")
