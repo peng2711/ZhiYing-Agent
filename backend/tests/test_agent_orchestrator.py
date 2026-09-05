@@ -214,3 +214,39 @@ def test_tool_use_round_trip_executes_only_whitelisted_tool():
         "build_diagnostic_plan",
     }
     assert "tool_result" in str(client.calls[1]["messages"])
+
+
+def test_rag_results_are_exposed_as_structured_citations():
+    class ToolUseBlock:
+        type, id, name, input = "tool_use", "toolu_rag", "search_knowledge_base", {"query": "退款政策"}
+    class TextBlock:
+        type, text = "text", "购买后 7 天内可以申请退款。"
+    class ToolClient:
+        def __init__(self):
+            self.calls = []
+            self.responses = [type("Response", (), {"content": [ToolUseBlock()]})(),
+                              type("Response", (), {"content": [TextBlock()]})()]
+        class Messages:
+            def __init__(self, owner): self.owner = owner
+            async def create(self, **kwargs):
+                self.owner.calls.append(kwargs)
+                return self.owner.responses.pop(0)
+        @property
+        def messages(self): return self.Messages(self)
+    class RagManager:
+        async def search_with_rewrite(self, tool_name, query, top_k=5):
+            data = [{"source_id": "refund-policy", "document_name": "退款政策", "version": "3.0",
+                     "updated_at": "2026-08-20", "section": "退款时限", "chunk": 2,
+                     "content": "购买后 7 天内可以申请无理由退款。", "score": 0.93}]
+            return type("Result", (), {"success": True, "data": data, "reranked": True})()
+    client = ToolClient()
+    agent = BillingAgent(client, "test-model")
+    agent.set_shared_tools(build_shared_rag_tools(RagManager()))
+    response = asyncio.run(agent.handle(make_request(
+        message="退款政策是什么？请给出依据",
+        intent=IntentCategory.QUERY,
+    )))
+    assert client.calls[0]["tool_choice"]["name"] == "search_knowledge_base"
+    assert response.citations[0]["source_id"] == "refund-policy"
+    assert response.citations[0]["version"] == "3.0"
+    assert response.citations[0]["chunk"] == 2

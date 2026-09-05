@@ -23,6 +23,12 @@ services:
       ANONYMIZED_TELEMETRY: "FALSE"
     volumes:
       - chroma-data:/chroma/chroma
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
   backend:
     build:
@@ -37,6 +43,7 @@ services:
       CHROMA_HOST: chromadb
       CHROMA_PORT: "8000"
       CHROMA_PERSIST_DIRECTORY: /app/data/chroma
+      BUSINESS_DB_PATH: /app/data/business/business.db
       EVAL_BASELINE_PATH: /app/data/eval/baseline.json
       ZHIYING_SKILLS_DIR: /app/skills
     volumes:
@@ -46,7 +53,7 @@ services:
       redis:
         condition: service_healthy
       chromadb:
-        condition: service_started
+        condition: service_healthy
 
   frontend:
     build:

@@ -120,6 +120,9 @@ class AgentResponse:
     tools_attempted: List[str] = field(default_factory=list)
     tools_used:  List[str] = field(default_factory=list)
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
+    citations: List[Dict[str, Any]] = field(default_factory=list)
+    pending_action: Optional[Dict[str, Any]] = None
+    ticket: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -153,6 +156,9 @@ class OrchestratorResult:
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
     routing_reason: str = ""
     routing_confidence: float = 0.0
+    citations: List[Dict[str, Any]] = field(default_factory=list)
+    pending_action: Optional[Dict[str, Any]] = None
+    ticket: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -197,13 +203,20 @@ class BaseAgent:
         self._last_tools_used: List[str] = []
         self._last_tool_traces: List[Dict[str, Any]] = []
         self._shared_tools: Dict[str, AgentToolSpec] = {}
+        self._domain_tools: Dict[str, AgentToolSpec] = {}
+        self._last_citations: List[Dict[str, Any]] = []
+        self._last_pending_action: Optional[Dict[str, Any]] = None
+        self._last_ticket: Optional[Dict[str, Any]] = None
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         """返回该角色真实可调用的工具白名单。"""
-        return dict(self._shared_tools)
+        return {**self._shared_tools, **self._domain_tools}
 
     def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
         self._shared_tools = dict(tools or {})
+
+    def set_domain_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
+        self._domain_tools = dict(tools or {})
 
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
@@ -211,6 +224,9 @@ class BaseAgent:
         self._last_tools_attempted = []
         self._last_tools_used = []
         self._last_tool_traces = []
+        self._last_citations = []
+        self._last_pending_action = None
+        self._last_ticket = None
         try:
             content = await self._call_llm(req)
             ms = (time.monotonic() - t0) * 1000
@@ -226,6 +242,9 @@ class BaseAgent:
                 tools_attempted=list(self._last_tools_attempted),
                 tools_used=list(self._last_tools_used),
                 tool_traces=list(self._last_tool_traces),
+                citations=list(self._last_citations),
+                pending_action=self._last_pending_action,
+                ticket=self._last_ticket,
             )
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
@@ -261,14 +280,27 @@ class BaseAgent:
         tools = self.get_tools()
         max_rounds = max(1, min(_env_int("ZHIYING_MAX_TOOL_ROUNDS", 3), 8))
         llm_timeout = max(1.0, _env_float("ZHIYING_LLM_TIMEOUT_S", 45.0))
-        rag_required = (
+        # 意图分类可能把“退款政策是什么”归为通用 QUERY。对明确询问政策、
+        # 规则或依据的问题仍强制检索，避免仅凭模型参数记忆回答且没有引用。
+        knowledge_markers = (
+            "政策", "规则", "规定", "依据", "条款", "时效", "须知",
+            "policy", "rule", "terms", "according to", "source",
+        )
+        intent_requires_rag = (
             req.intent is not None
             and getattr(req.intent, "value", req.intent) in RAG_REQUIRED_INTENTS
-            and "search_knowledge_base" in tools
+        )
+        message_requires_rag = any(
+            marker in req.message.lower() for marker in knowledge_markers
+        )
+        rag_required = (
+            "search_knowledge_base" in tools
+            and (intent_requires_rag or message_requires_rag)
         )
         tools_used: List[str] = []
         tools_attempted: List[str] = []
         tool_traces: List[Dict[str, Any]] = []
+        citations: List[Dict[str, Any]] = []
         for round_idx in range(max_rounds):
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
@@ -304,6 +336,7 @@ class BaseAgent:
                 self._last_tools_attempted = tools_attempted
                 self._last_tools_used = tools_used
                 self._last_tool_traces = tool_traces
+                self._last_citations = citations
                 return extract_text_content(resp.content)
 
             messages.append({"role": "assistant", "content": resp.content})
@@ -334,6 +367,21 @@ class BaseAgent:
                             result_success = True
                         if result_success:
                             tools_used.append(name)
+                            if name == "search_knowledge_base" and isinstance(result, dict):
+                                for item in result.get("results", []):
+                                    if not isinstance(item, dict) or item.get("fallback"):
+                                        continue
+                                    citation = {key: item.get(key) for key in
+                                        ("source_id", "document_name", "title", "version", "updated_at", "section", "chunk", "content", "score")
+                                        if item.get(key) is not None}
+                                    if citation and citation not in citations:
+                                        citations.append(citation)
+                            elif name == "prepare_refund" and isinstance(result, dict):
+                                self._last_pending_action = {"type": "refund", "step": "pending_confirmation",
+                                    **{key: value for key, value in result.items()
+                                       if key not in {"success", "confirmation_token"}}}
+                            elif name == "create_ticket" and isinstance(result, dict):
+                                self._last_ticket = result.get("ticket")
                     except Exception as ex:
                         call_success = False
                         logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
@@ -366,6 +414,7 @@ class BaseAgent:
         self._last_tools_attempted = tools_attempted
         self._last_tools_used = tools_used
         self._last_tool_traces = tool_traces
+        self._last_citations = citations
         raise RuntimeError(f"{self.agent_type.value} 工具调用超过最大轮数")
 
     @staticmethod
@@ -459,7 +508,7 @@ class GeneralAgent(BaseAgent):
         input_contract=("对话历史", "用户画像", "意图与紧急度", "知识库上下文"),
         output_contract=("先回应核心问题", "信息不足时只询问必要字段", "明确下一步和边界"),
         handoff_conditions=("涉及权限、资金、隐私或复杂投诉", "用户明确要求人工"),
-        tool_scope=("search_knowledge_base", "inspect_request_context", "suggest_required_fields"),
+        tool_scope=("search_knowledge_base", "get_order", "get_logistics", "inspect_request_context", "suggest_required_fields"),
         temperature=0.3,
         max_tokens=900,
     )
@@ -522,13 +571,13 @@ class BillingAgent(BaseAgent):
         input_contract=("订单号", "金额与币种", "支付时间", "支付渠道", "用户期望", "知识库上下文"),
         output_contract=("需要核验的信息", "当前可判断内容", "下一步处理路径", "时效边界"),
         handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
-        tool_scope=("search_knowledge_base", "check_billing_fields", "compare_amounts"),
+        tool_scope=("search_knowledge_base", "get_order", "check_refund_eligibility", "prepare_refund", "get_refund_status", "check_billing_fields", "compare_amounts"),
         temperature=0.0,
         max_tokens=1100,
     )
     system_prompt = (
         "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
-        "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
+        "对财务问题保持准确和专业。最终退款只能在用户明确确认后由服务端状态机执行。"
     )
 
     def _build_role_packet(self, req: Request) -> str:
@@ -568,7 +617,7 @@ class EscalationAgent(BaseAgent):
         input_contract=("用户消息", "意图", "紧急度", "结构化实体", "对话背景"),
         output_contract=("升级原因", "已知信息摘要", "还需补充的信息", "保守的后续说明"),
         handoff_conditions=("用户明确要求人工", "紧急或高风险场景"),
-        tool_scope=("search_knowledge_base", "create_handoff_summary"),
+        tool_scope=("search_knowledge_base", "create_handoff_summary", "create_ticket"),
         temperature=0.0,
         max_tokens=500,
     )
@@ -585,8 +634,35 @@ class EscalationAgent(BaseAgent):
         intent = req.intent.value if req.intent else "unknown"
         urgency = req.urgency.name if req.urgency else "UNKNOWN"
         entities = json.dumps(req.entities or {}, ensure_ascii=False)
+        ticket = None
+        tools_used: List[str] = []
+        tool_traces: List[Dict[str, Any]] = []
+        spec = self.get_tools().get("create_ticket")
+        if spec is not None:
+            args = {"issue_type": intent, "priority": urgency.lower(), "summary": req.message[:1000]}
+            try:
+                tool_result = spec.handler(req, args)
+                if inspect.isawaitable(tool_result):
+                    tool_result = await tool_result
+                ticket = tool_result.get("ticket") if isinstance(tool_result, dict) else None
+                tools_used.append("create_ticket")
+                tool_traces.append({"agent_type": self.agent_type.value, "tool_name": "create_ticket",
+                    "tool_use_id": "escalation_create_ticket", "input": args, "success": True,
+                    "result_success": True, "latency_ms": 0.0, "cached": False, "reranked": False, "error": ""})
+            except Exception as exc:
+                logger.warning("创建人工工单失败: %s", exc)
+                tool_traces.append({"agent_type": self.agent_type.value, "tool_name": "create_ticket",
+                    "tool_use_id": "escalation_create_ticket", "input": args, "success": False,
+                    "result_success": False, "latency_ms": 0.0, "cached": False, "reranked": False, "error": str(exc)})
+        if ticket:
+            ticket_line = f"工单号：{ticket['ticket_id']}（状态：{ticket['status']}）\n"
+        elif spec is not None:
+            ticket_line = "工单创建暂时失败，已保留本次交接摘要。\n"
+        else:
+            ticket_line = "已生成交接摘要。\n"
         content = (
-            "我已将这个问题标记为人工升级处理。\n\n"
+            "我已将这个问题标记为人工升级并转交人工客服。\n\n"
+            f"{ticket_line}"
             f"升级原因：意图={intent}，紧急度={urgency}\n"
             f"已记录信息：{entities}\n"
             "请不要发送密码、短信验证码或完整支付凭证；人工客服会根据会话记录继续核验。"
@@ -600,7 +676,10 @@ class EscalationAgent(BaseAgent):
             success=True,
             latency_ms=ms,
             escalate=True,
-            tools_used=[],
+            tools_attempted=["create_ticket"] if spec is not None else [],
+            tools_used=tools_used,
+            tool_traces=tool_traces,
+            ticket=ticket,
         )
 
 
@@ -691,6 +770,7 @@ class AgentOrchestrator:
         model:    str = "claude-3-5-sonnet-20241022",
         skill_manager: Optional[Any] = None,
         rag_tool_manager: Optional[Any] = None,
+        business_workflow: Optional[Any] = None,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -702,6 +782,7 @@ class AgentOrchestrator:
         self._composer = ResponseComposer(client, model, skill_manager)
         self._shared_tools: Dict[str, AgentToolSpec] = {}
         self._recent_tool_traces = deque(maxlen=_env_int("ZHIYING_TOOL_TRACE_MAX", 200))
+        self._business_workflow = business_workflow
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
@@ -744,6 +825,16 @@ class AgentOrchestrator:
             for agent in agents:
                 agent.set_shared_tools(self._shared_tools)
 
+    def set_domain_tools(self, tools_by_agent: Optional[Dict[str, Dict[str, AgentToolSpec]]]) -> None:
+        """为各角色注入最小权限业务工具。"""
+        configured = tools_by_agent or {}
+        for agent_type, agents in self._pool.items():
+            for agent in agents:
+                agent.set_domain_tools(configured.get(agent_type.value, {}))
+
+    def set_business_workflow(self, workflow: Optional[Any]) -> None:
+        self._business_workflow = workflow
+
     async def recognize_intent(
         self,
         message: str,
@@ -763,6 +854,11 @@ class AgentOrchestrator:
             "tools_used": list(result.tools_used),
             "tool_calls": list(result.tool_traces),
             "escalated": result.escalated,
+            "citation_sources": [{key: citation.get(key) for key in
+                ("source_id", "document_name", "title", "version", "chunk")
+                if citation.get(key) is not None} for citation in result.citations],
+            "pending_action": result.pending_action,
+            "ticket_id": result.ticket.get("ticket_id") if result.ticket else None,
             "latency_ms": round(result.latency_ms, 1),
         }
         self._recent_tool_traces.append(trace)
@@ -796,6 +892,22 @@ class AgentOrchestrator:
             req.urgency = intent_result.urgency
             req.intent_confidence = intent_result.confidence
 
+        if self._business_workflow is not None:
+            workflow_outcome = await self._business_workflow.handle(req)
+            if workflow_outcome is not None:
+                result = OrchestratorResult(
+                    request_id=req.request_id, response=workflow_outcome.response,
+                    agent_type=AgentType.BILLING, intent=req.intent, escalated=False,
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                    agent_types=[AgentType.BILLING], primary_agent=AgentType.BILLING,
+                    tools_attempted=list(workflow_outcome.tools_used), tools_used=list(workflow_outcome.tools_used),
+                    tool_traces=list(workflow_outcome.tool_traces), routing_reason="命中持久化业务任务状态机",
+                    routing_confidence=1.0, pending_action=workflow_outcome.pending_action,
+                    ticket=workflow_outcome.ticket,
+                )
+                self._record_tool_trace(result)
+                return result
+
         if self._needs_clarification(req):
             result = OrchestratorResult(
                 request_id=req.request_id,
@@ -828,7 +940,18 @@ class AgentOrchestrator:
         ):
             escalated = True
             logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
-            # 生产环境：此处创建工单、通知人工客服
+            if response.agent_type != AgentType.ESCALATION:
+                handoff = await self._execute(req, AgentType.ESCALATION)
+                if handoff.success:
+                    response = AgentResponse(
+                        agent_type=response.agent_type, content=f"{response.content}\n\n{handoff.content}",
+                        success=response.success, confidence=response.confidence,
+                        latency_ms=response.latency_ms + handoff.latency_ms, escalate=True,
+                        tools_attempted=list(dict.fromkeys(response.tools_attempted + handoff.tools_attempted)),
+                        tools_used=list(dict.fromkeys(response.tools_used + handoff.tools_used)),
+                        tool_traces=response.tool_traces + handoff.tool_traces,
+                        citations=response.citations, pending_action=response.pending_action, ticket=handoff.ticket,
+                    )
 
         result = OrchestratorResult(
             request_id=req.request_id,
@@ -845,6 +968,9 @@ class AgentOrchestrator:
             tool_traces=list(response.tool_traces),
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
+            citations=list(response.citations),
+            pending_action=response.pending_action,
+            ticket=response.ticket,
         )
         self._record_tool_trace(result)
         return result
@@ -877,6 +1003,11 @@ class AgentOrchestrator:
             for response in valid_responses
             for trace in response.tool_traces
         ]
+        citations: List[Dict[str, Any]] = []
+        for agent_response in valid_responses:
+            for citation in agent_response.citations:
+                if citation not in citations:
+                    citations.append(citation)
         result = OrchestratorResult(
             request_id=req.request_id,
             response=combined,
@@ -895,6 +1026,9 @@ class AgentOrchestrator:
             tool_traces=tool_traces,
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
+            citations=citations,
+            pending_action=next((item.pending_action for item in valid_responses if item.pending_action), None),
+            ticket=next((item.ticket for item in valid_responses if item.ticket), None),
         )
         self._record_tool_trace(result)
         return result

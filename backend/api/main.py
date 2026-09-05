@@ -52,6 +52,7 @@ _tool_manager = None
 _monitor      = None
 _evaluator    = None
 _skill_manager = None
+_business_backend = None
 
 def _llm_cfg() -> Dict[str, Any]:
     key = os.getenv("LLM_API_KEY", "")
@@ -67,13 +68,24 @@ def _llm_cfg() -> Dict[str, Any]:
     return cfg
 
 
+def _chroma_cfg() -> Dict[str, Any]:
+    """本地默认连接 8001 并回退仓库数据目录；Compose 会显式覆盖。"""
+    return {
+        "host": os.getenv("CHROMA_HOST", "localhost").strip() or "localhost",
+        "port": int(os.getenv("CHROMA_PORT", "8001")),
+        "path": os.getenv("CHROMA_PERSIST_DIRECTORY", str(pathlib.Path(_ROOT) / "data" / "chroma")),
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _business_backend
 
     print(BANNER, flush=True)
 
     from agents.agent_orchestrator import AgentOrchestrator, Request, build_shared_rag_tools
+    from agents.tools import build_business_tools
+    from business import BusinessWorkflow, MockBusinessBackend
     from core.intent_recognizer import IntentRecognizer
     from evaluation.evaluator import EndToEndEvaluator
     from mcp.knowledge_base import KnowledgeBase
@@ -83,6 +95,7 @@ async def lifespan(app: FastAPI):
     from core.skill_loader import SkillManager
 
     cfg = _llm_cfg()
+    chroma_cfg = _chroma_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
 
     # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
@@ -111,13 +124,19 @@ async def lifespan(app: FastAPI):
     # 记忆管理器（Redis 工作记忆 + ChromaDB 情景记忆/用户画像）
     _memory = MemoryManager(
         redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
-        chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
+        chroma_host=chroma_cfg["host"],
+        chroma_port=chroma_cfg["port"],
+        chroma_path=chroma_cfg["path"],
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
     )
+
+    _business_backend = MockBusinessBackend(
+        os.getenv("BUSINESS_DB_PATH", str(pathlib.Path(_ROOT) / "data" / "business" / "business.db"))
+    )
+    _orchestrator.set_domain_tools(build_business_tools(_business_backend, _memory))
+    _orchestrator.set_business_workflow(BusinessWorkflow(_business_backend, _memory))
 
     # MCP 工具管理器 + RAG 知识库（基于 ChromaDB 的真实检索）
     _tool_manager = MCPToolManager(
@@ -126,9 +145,9 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
     kb = KnowledgeBase(
-        chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
+        chroma_host=chroma_cfg["host"],
+        chroma_port=chroma_cfg["port"],
+        chroma_path=chroma_cfg["path"],
     )
     logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
 
@@ -317,6 +336,10 @@ class ChatRequest(BaseModel):
     conv_id:     Optional[str] = Field(default=None, min_length=1, max_length=128)
 
 
+class DemoResetRequest(BaseModel):
+    conv_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+
+
 class ChatResponse(BaseModel):
     conv_id:     str
     request_id:  str = ""
@@ -337,6 +360,9 @@ class ChatResponse(BaseModel):
     entities: Dict[str, List[str]] = Field(default_factory=dict)
     intent_confidence: float = 0.0
     intent_source_scores: Dict[str, float] = Field(default_factory=dict)
+    citations: List[Dict[str, Any]] = Field(default_factory=list)
+    pending_action: Optional[Dict[str, Any]] = None
+    ticket: Optional[Dict[str, Any]] = None
 
 
 class ToolTraceResponse(BaseModel):
@@ -472,6 +498,9 @@ async def chat(req: ChatRequest, response: Response, request: FastAPIRequest):
         entities=intent_result.entities,
         intent_confidence=round(intent_result.confidence, 4),
         intent_source_scores=intent_result.source_scores,
+        citations=result.citations,
+        pending_action=result.pending_action,
+        ticket=result.ticket,
     )
 
 
@@ -504,6 +533,30 @@ async def list_recent_tool_traces(limit: int = Query(default=20, ge=1, le=100)):
     return RecentToolTracesResponse(items=_orchestrator.get_recent_tool_traces(limit=limit))
 
 
+@app.get("/tickets/{ticket_id}", tags=["业务后台"])
+async def get_ticket(ticket_id: str, request: FastAPIRequest):
+    if _business_backend is None:
+        raise HTTPException(503, "业务后台未初始化")
+    user_id, _, _ = _resolve_chat_identity(request, "anonymous")
+    try:
+        return _business_backend.get_ticket(ticket_id, user_id)
+    except Exception as exc:
+        raise HTTPException(404, "未找到该工单") from exc
+
+
+@app.post("/demo/reset", tags=["业务后台"])
+async def reset_demo(request: FastAPIRequest, body: Optional[DemoResetRequest] = None):
+    """恢复演示订单。生产环境强制禁用，避免成为危险管理接口。"""
+    if os.getenv("APP_ENV", "development").lower() not in {"development", "test"}:
+        raise HTTPException(404, "接口不存在")
+    if _business_backend is None or _memory is None:
+        raise HTTPException(503, "业务后台未初始化")
+    user_id, _, _ = _resolve_chat_identity(request, "anonymous")
+    if body and body.conv_id:
+        await _memory.clear_task_state(user_id, body.conv_id)
+    return {"message": "演示业务数据已恢复", **_business_backend.reset_demo_data()}
+
+
 @app.get("/metrics")
 async def prometheus_metrics():
     """Prometheus 指标入口。"""
@@ -527,6 +580,10 @@ class DocInput(BaseModel):
     source_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     title:   str = Field(min_length=1, max_length=256)
     content: str = Field(min_length=1, max_length=200_000)
+    document_name: Optional[str] = Field(default=None, max_length=256)
+    version: str = Field(default="1.0", min_length=1, max_length=64)
+    updated_at: Optional[str] = Field(default=None, max_length=64)
+    section: Optional[str] = Field(default=None, max_length=256)
 
 
 class BatchDocInput(BaseModel):
@@ -717,11 +774,12 @@ async def _cli():
         model=cfg["model"],
         skill_manager=skill_manager,
     )
+    chroma_cfg = _chroma_cfg()
     mem  = MemoryManager(
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
-        chroma_host=os.getenv("CHROMA_HOST", "localhost"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/tmp/chroma"),
+        chroma_host=chroma_cfg["host"],
+        chroma_port=chroma_cfg["port"],
+        chroma_path=chroma_cfg["path"],
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],

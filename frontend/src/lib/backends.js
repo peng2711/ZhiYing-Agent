@@ -81,6 +81,14 @@ export async function requestToolTrace(type, settings, requestId) {
   return normalizeToolTraceResponse(raw)
 }
 
+export async function resetDemo(type, settings) {
+  return requestJson(backendMeta(type, settings).baseUrl, '/demo/reset', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conv_id: settings.conversationId || undefined })
+  })
+}
+
 export async function addKnowledge(type, settings, documents) {
   return requestJson(backendMeta(type, settings).baseUrl, '/knowledge/add', {
     method: 'POST',
@@ -126,6 +134,10 @@ function normalizeChatResponse(type, raw) {
     escalated: Boolean(raw.escalated),
     latencyMs: Number(raw.latency_ms ?? raw.latencyMs ?? 0),
     knowledgeUsed: Boolean(raw.knowledge_used ?? raw.knowledgeUsed),
+    toolsUsed: raw.tools_used || raw.toolsUsed || [],
+    citations: raw.citations || [],
+    pendingAction: raw.pending_action || raw.pendingAction || null,
+    ticket: raw.ticket || null,
     verified: raw.verified,
     grounded: raw.grounded,
     raw
@@ -149,7 +161,8 @@ function normalizeToolTraceResponse(raw) {
 
 async function requestJson(baseUrl, path, options = {}) {
   const url = `${normalizeBaseUrl(baseUrl)}${path}`
-  const response = await fetch(url, options)
+  // 本地前后端跨端口时也必须携带 guest_id Cookie，否则多轮任务会丢失用户身份。
+  const response = await fetch(url, { credentials: 'include', ...options })
   const text = await response.text()
   let data = null
   try {

@@ -14,6 +14,7 @@ ChromaDB 在这里的角色：
 import asyncio
 import hashlib
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import chromadb
@@ -84,6 +85,10 @@ class KnowledgeBase:
             content = doc.get("content", "")
             # source_id 用于文档更新时清理旧切片；未提供时按标题生成稳定键。
             source_id = str(doc.get("source_id") or hashlib.sha256(title.encode("utf-8")).hexdigest()[:16])
+            document_name = str(doc.get("document_name") or title)
+            version = str(doc.get("version") or "1.0")
+            updated_at = str(doc.get("updated_at") or datetime.now(timezone.utc).date().isoformat())
+            section = str(doc.get("section") or title)
             chunks  = self._chunk_text(content, chunk_size=500)
 
             # 同一来源重复导入应覆盖旧版本，避免旧政策和新政策同时被召回。
@@ -101,6 +106,10 @@ class KnowledgeBase:
                 metas.append({
                     "title": title,
                     "source_id": source_id,
+                    "document_name": document_name,
+                    "version": version,
+                    "updated_at": updated_at,
+                    "section": section,
                     "chunk_index": i,
                     "total_chunks": len(chunks),
                 })
@@ -141,6 +150,11 @@ class KnowledgeBase:
             ):
                 items.append({
                     "title":    meta.get("title", ""),
+                    "document_name": meta.get("document_name", meta.get("title", "")),
+                    "source_id": meta.get("source_id", ""),
+                    "version": meta.get("version", "1.0"),
+                    "updated_at": meta.get("updated_at", ""),
+                    "section": meta.get("section", meta.get("title", "")),
                     "content":  doc,
                     "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
                     "chunk":    meta.get("chunk_index", 0),

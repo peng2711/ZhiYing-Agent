@@ -33,6 +33,7 @@
         </div>
         <div class="heading-actions">
           <span class="session-label">{{ settings.conversationId || '新会话' }}</span>
+          <button class="quiet-button" :disabled="busy" @click="resetDemoData">重置演示</button>
           <button class="quiet-button" @click="clearConversation">清空</button>
         </div>
       </div>
@@ -115,6 +116,31 @@
                 <small v-if="item.meta">{{ item.meta }}</small>
               </div>
               <p>{{ item.content }}</p>
+              <div v-if="item.pendingAction?.step === 'pending_confirmation'" class="business-action-card">
+                <div>
+                  <strong>等待操作确认</strong>
+                  <span>订单 {{ item.pendingAction.order_id || '-' }} · ¥{{ Number(item.pendingAction.amount || 0).toFixed(2) }}</span>
+                </div>
+                <div class="business-action-buttons">
+                  <button type="button" :disabled="busy" @click="sendMessage('确认退款')">确认退款</button>
+                  <button type="button" class="quiet-button" :disabled="busy" @click="sendMessage('取消')">取消</button>
+                </div>
+              </div>
+              <div v-if="item.ticket" class="ticket-card">
+                <strong>人工工单 #{{ item.ticket.ticket_id }}</strong>
+                <span>状态：{{ item.ticket.status }} · 优先级：{{ item.ticket.priority }}</span>
+              </div>
+              <div v-if="item.citations?.length" class="citation-list">
+                <div class="trace-head"><span>引用来源</span><small>{{ item.citations.length }} 条</small></div>
+                <details v-for="(citation, index) in item.citations" :key="`${item.id}-citation-${index}`">
+                  <summary>
+                    <strong>[{{ index + 1 }}] {{ citation.document_name || citation.title || '知识库文档' }}</strong>
+                    <span>v{{ citation.version || '1.0' }} · chunk {{ citation.chunk ?? 0 }}</span>
+                  </summary>
+                  <p>{{ citation.content }}</p>
+                  <small>{{ citation.section || '-' }} · 更新于 {{ citation.updated_at || '未知' }}</small>
+                </details>
+              </div>
               <div v-if="item.trace" class="message-trace">
                 <div class="trace-head">
                   <span>工具调用</span>
@@ -325,7 +351,7 @@
           <section class="workspace-card">
             <div class="card-heading"><div><span class="kicker">Scores</span><h2>平均评分</h2></div></div>
             <div class="score-list">
-              <div v-for="(value, key) in evalData.avg_scores" :key="key"><span>{{ key }}</span><i><b :style="{ width: `${Math.min(Number(value) * 10, 100)}%` }"></b></i><strong>{{ Number(value).toFixed(2) }}</strong></div>
+              <div v-for="(value, key) in evalData.avg_scores" :key="key"><span>{{ key }}</span><i><b :style="{ width: `${scoreBarWidth(key, value)}%` }"></b></i><strong>{{ Number(value).toFixed(2) }}</strong></div>
             </div>
           </section>
           <section class="workspace-card">
@@ -354,6 +380,7 @@ import {
   requestSearch,
   requestToolTrace,
   requestSkills,
+  resetDemo,
   runEvaluation as requestEvaluation,
   saveSettings,
   uploadKnowledge
@@ -473,8 +500,15 @@ async function sendMessage(contentOverride) {
     }
     lastResponse.value = response
     lastTrace.value = await loadToolTrace(response.requestId)
+    if (response.toolsUsed?.some(name => ['execute_refund', 'cancel_pending_operation'].includes(name))) {
+      messages.value.forEach(item => { item.pendingAction = null })
+    }
     const meta = [response.intent, response.primaryAgent || response.agentType, response.knowledgeUsed ? 'RAG' : '', response.escalated ? '转人工' : ''].filter(Boolean).join(' · ')
-    messages.value.push({ id: createMessageId(), role: 'assistant', content: response.response, meta, trace: lastTrace.value?.trace || null })
+    messages.value.push({
+      id: createMessageId(), role: 'assistant', content: response.response, meta,
+      trace: lastTrace.value?.trace || null, citations: response.citations || [],
+      pendingAction: response.pendingAction || null, ticket: response.ticket || null
+    })
     await loadMonitor()
   } catch (error) {
     messages.value.push({ id: createMessageId(), role: 'assistant', content: error.message, meta: '请求失败' })
@@ -491,6 +525,21 @@ function clearConversation() {
   lastTrace.value = null
   settings.conversationId = ''
   persist()
+}
+
+async function resetDemoData() {
+  if (busy.value) return
+  busy.value = true
+  try {
+    await resetDemo(settings.backend, settings)
+    clearConversation()
+    showToast('演示订单、退款和工单已恢复')
+  } catch (error) {
+    statusText.value = error.message
+    showToast('重置失败，仅开发环境支持')
+  } finally {
+    busy.value = false
+  }
 }
 
 async function searchKnowledge() {
@@ -556,6 +605,13 @@ async function loadToolTrace(requestId) {
 function formatPercent(value) {
   const number = Number(value || 0)
   return `${(number <= 1 ? number * 100 : number).toFixed(1)}%`
+}
+
+function scoreBarWidth(key, value) {
+  const number = Number(value || 0)
+  if (String(key).includes('latency_ms')) return Math.max(0, 100 - Math.min(number, 2000) / 20)
+  if (key === 'unsafe_execution_rate') return Math.max(0, 100 - number * 100)
+  return Math.min(Math.max(number * 100, 0), 100)
 }
 
 function formatJson(value) {

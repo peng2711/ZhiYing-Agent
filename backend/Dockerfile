@@ -48,8 +48,8 @@ COPY --from=dependencies --chown=zhiying:zhiying /root/.cache/chroma /home/zhiyi
 COPY --chown=zhiying:zhiying . .
 
 # 创建必要目录，只调整运行期需要写入的目录权限，避免递归 chown 整个应用。
-RUN mkdir -p /app/data/chroma /app/logs /app/config && \
-    chown zhiying:zhiying /app/data /app/data/chroma /app/logs /app/config
+RUN mkdir -p /app/data/chroma /app/data/business /app/logs /app/config && \
+    chown zhiying:zhiying /app/data /app/data/chroma /app/data/business /app/logs /app/config
 USER zhiying
 
 EXPOSE 8000

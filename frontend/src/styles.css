@@ -455,6 +455,26 @@ a { color: inherit; }
 .message-meta small { font-weight: 500; color: var(--muted); }
 .message p { margin: 8px 0 0; line-height: 1.7; white-space: pre-wrap; color: #eef1fb; }
 
+.business-action-card,
+.ticket-card,
+.citation-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid rgba(111, 120, 247, 0.28);
+  border-radius: 12px;
+  background: rgba(111, 120, 247, 0.08);
+}
+.business-action-card > div:first-child, .ticket-card { gap: 4px; }
+.business-action-card strong, .ticket-card strong, .citation-list strong { color: var(--text); font-size: 12px; }
+.business-action-card span, .ticket-card span, .citation-list summary span, .citation-list small { color: var(--muted); font-size: 11px; }
+.business-action-buttons { display: flex; gap: 8px; }
+.business-action-buttons button { padding: 7px 11px; font-size: 11px; }
+.citation-list details { padding-top: 8px; border-top: 1px solid var(--line); }
+.citation-list summary { display: flex; justify-content: space-between; gap: 12px; cursor: pointer; }
+.citation-list details p { color: var(--text-soft); font-size: 12px; }
+
 .message-trace {
   margin-top: 12px;
   padding-top: 12px;

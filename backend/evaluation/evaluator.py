@@ -28,6 +28,7 @@ from core.llm_utils import extract_text_content
 from core.llm_client import LLMClient, create_llm_client
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer
+from evaluation.business_evaluator import BusinessWorkflowEvaluator
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +256,7 @@ class EndToEndEvaluator:
         self._orchestrator     = orchestrator
         self._judge            = LLMJudge(client, model)
         self._intent_evaluator = IntentEvaluator(recognizer)
+        self._business_evaluator = BusinessWorkflowEvaluator()
         self._history:         List[EvalReport] = []
         self._baseline_path = pathlib.Path(baseline_path) if baseline_path else None
         self._baseline: Optional[EvalReport] = self._load_baseline()
@@ -305,18 +307,28 @@ class EndToEndEvaluator:
                         if k in r.scores:
                             all_scores[k].append(r.scores[k])
 
-        # 3. 汇总
+        # 3. 确定性业务闭环评测：使用临时数据库，不污染线上或演示订单。
+        business_report = await self._business_evaluator.evaluate()
+        for item in business_report["results"]:
+            results.append(EvalResult(
+                test_id=item["test_id"], passed=bool(item["passed"]),
+                scores=dict(item.get("scores", {})), detail=str(item.get("detail", "")),
+                metadata={"evaluation_type": "deterministic_business_e2e"},
+            ))
+
+        # 4. 汇总
         avg_scores = {k: round(statistics.mean(v), 4) for k, v in all_scores.items() if v}
+        avg_scores.update(business_report["metrics"])
         if intent_metrics:
             avg_scores["intent_accuracy"] = intent_metrics["accuracy"]
 
         passed_count = sum(1 for r in results if r.passed)
         pass_rate    = passed_count / len(results) if results else 0.0
 
-        # 4. 回归检测
+        # 5. 回归检测
         regressions = self._detect_regressions(avg_scores)
 
-        # 5. 优化建议
+        # 6. 优化建议
         recommendations = self._recommendations(avg_scores, intent_metrics)
 
         report = EvalReport(
@@ -429,6 +441,10 @@ class EndToEndEvaluator:
         prev = prev_report.avg_scores
         regressions = []
         for metric, value in current.items():
+            if metric == "unsafe_execution_rate" and metric in prev:
+                if value > prev[metric]:
+                    regressions.append(f"{metric}: {prev[metric]:.3f} → {value:.3f}（安全退化）")
+                continue
             if metric in prev and prev[metric] > 0:
                 delta = (value - prev[metric]) / prev[metric]
                 if delta < -0.05:
@@ -453,6 +469,12 @@ class EndToEndEvaluator:
             recs.append("完整性偏低：Agent 可能过早结束回答，考虑在 prompt 中要求提供完整解决方案")
         if scores.get("helpfulness", 1.0) < 0.80:
             recs.append("有用性偏低：回答可能过于抽象，考虑要求 Agent 提供具体操作步骤")
+        if scores.get("task_completion_rate", 1.0) < 1.0:
+            recs.append("业务任务完成率未达 100%：检查任务状态迁移、工具参数和后台状态变化")
+        if scores.get("tool_selection_accuracy", 1.0) < 1.0:
+            recs.append("业务工具选择不准确：检查角色工具白名单和状态机步骤")
+        if scores.get("unsafe_execution_rate", 0.0) > 0:
+            recs.append("发现未确认业务写操作：阻断发布并检查服务端确认校验")
         if not recs:
             recs.append("所有指标均达标，继续保持")
         return recs

@@ -48,6 +48,8 @@ class AgentToolSpec:
     description: str
     input_schema: Dict[str, Any]
     handler: AgentToolHandler
+    risk_level: str = "read_only"
+    requires_confirmation: bool = False
 
 
 def make_tool(
@@ -56,6 +58,8 @@ def make_tool(
     properties: Dict[str, Any],
     handler: AgentToolHandler,
     required: Optional[List[str]] = None,
+    risk_level: str = "read_only",
+    requires_confirmation: bool = False,
 ) -> AgentToolSpec:
     """创建带 JSON Schema 的 Agent 工具。"""
     return AgentToolSpec(
@@ -68,7 +72,71 @@ def make_tool(
             "additionalProperties": False,
         },
         handler=handler,
+        risk_level=risk_level,
+        requires_confirmation=requires_confirmation,
     )
+
+
+def build_business_tools(backend: Any, task_store: Any) -> Dict[str, Dict[str, AgentToolSpec]]:
+    """构建按角色隔离的业务工具；退款最终执行不暴露给 LLM。"""
+    def order_id(req: Request, args: Dict[str, Any]) -> str:
+        value = str(args.get("order_id") or "").strip()
+        if not value:
+            values = (req.entities or {}).get("order_id", [])
+            value = str(values[0]) if values else ""
+        if not value:
+            raise ValueError("缺少订单号")
+        return value
+
+    def get_order(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+        return {"success": True, "order": backend.get_order(order_id(req, args), req.user_id)}
+
+    def get_logistics(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+        return {"success": True, "logistics": backend.get_logistics(order_id(req, args), req.user_id)}
+
+    def check_refund_eligibility(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+        return {"success": True, **backend.check_refund_eligibility(order_id(req, args), req.user_id)}
+
+    async def prepare_refund(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+        operation = backend.prepare_refund(order_id(req, args), req.user_id, req.conv_id,
+                                           str(args.get("reason") or "用户申请")[:200])
+        await task_store.set_task_state(req.user_id, req.conv_id,
+                                        {"type": "refund", "step": "pending_confirmation", **operation})
+        return {"success": True, **{k: v for k, v in operation.items() if k != "confirmation_token"}}
+
+    def get_refund_status(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+        return {"success": True, "refund": backend.get_refund_status(order_id(req, args), req.user_id)}
+
+    def create_ticket(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+        ticket = backend.create_ticket(
+            req.user_id, req.conv_id,
+            str(args.get("issue_type") or getattr(req.intent, "value", "other")),
+            str(args.get("priority") or getattr(req.urgency, "name", "MEDIUM")).lower(),
+            str(args.get("summary") or req.message),
+            {"entities": req.entities or {}, "request_id": req.request_id,
+             "conversation_context": (req.context or "")[-4000:]},
+        )
+        return {"success": True, "ticket": ticket}
+
+    schema = {"order_id": {"type": "string", "description": "订单号"}}
+    return {
+        "general": {
+            "get_order": make_tool("get_order", "从模拟业务后台查询当前用户订单。", schema, get_order, ["order_id"]),
+            "get_logistics": make_tool("get_logistics", "查询订单的真实模拟物流轨迹。", schema, get_logistics, ["order_id"]),
+        },
+        "billing": {
+            "get_order": make_tool("get_order", "从模拟业务后台查询当前用户订单。", schema, get_order, ["order_id"]),
+            "check_refund_eligibility": make_tool("check_refund_eligibility", "检查退款资格和可退金额。", schema, check_refund_eligibility, ["order_id"]),
+            "prepare_refund": make_tool("prepare_refund", "生成退款确认单；此步骤不会退款。",
+                {**schema, "reason": {"type": "string"}}, prepare_refund, ["order_id", "reason"], "write", True),
+            "get_refund_status": make_tool("get_refund_status", "查询订单退款状态。", schema, get_refund_status, ["order_id"]),
+        },
+        "escalation": {
+            "create_ticket": make_tool("create_ticket", "创建持久化人工客服工单。",
+                {"issue_type": {"type": "string"}, "priority": {"type": "string"}, "summary": {"type": "string"}},
+                create_ticket, ["issue_type", "priority", "summary"], "write"),
+        },
+    }
 
 
 def inspect_request_context(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
