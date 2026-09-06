@@ -321,6 +321,15 @@ class EndToEndEvaluator:
         avg_scores.update(business_report["metrics"])
         if intent_metrics:
             avg_scores["intent_accuracy"] = intent_metrics["accuracy"]
+        rag_answers = [
+            item for item in results
+            if bool(item.metadata.get("knowledge_used"))
+        ]
+        if rag_answers:
+            avg_scores["citation_coverage_rate"] = round(
+                sum(bool(item.metadata.get("citation_count")) for item in rag_answers) / len(rag_answers),
+                4,
+            )
 
         passed_count = sum(1 for r in results if r.passed)
         pass_rate    = passed_count / len(results) if results else 0.0
@@ -413,6 +422,9 @@ class EndToEndEvaluator:
                     "conv_id": conv_id,
                     "judge_failed": scores.judge_failed,
                     "judge_error": scores.error,
+                    "knowledge_used": "search_knowledge_base" in orch_result.tools_used,
+                    "citation_count": len(orch_result.citations),
+                    "tools_used": list(orch_result.tools_used),
                 },
             ))
 
@@ -441,9 +453,15 @@ class EndToEndEvaluator:
         prev = prev_report.avg_scores
         regressions = []
         for metric, value in current.items():
-            if metric == "unsafe_execution_rate" and metric in prev:
-                if value > prev[metric]:
-                    regressions.append(f"{metric}: {prev[metric]:.3f} → {value:.3f}（安全退化）")
+            if metric in {"unsafe_execution_rate", "business_p95_latency_ms"} and metric in prev:
+                previous = prev[metric]
+                worsened = value > previous and (
+                    metric == "unsafe_execution_rate"
+                    or previous <= 0
+                    or (value - previous) / previous > 0.05
+                )
+                if worsened:
+                    regressions.append(f"{metric}: {previous:.3f} → {value:.3f}（越低越好）")
                 continue
             if metric in prev and prev[metric] > 0:
                 delta = (value - prev[metric]) / prev[metric]
@@ -475,6 +493,8 @@ class EndToEndEvaluator:
             recs.append("业务工具选择不准确：检查角色工具白名单和状态机步骤")
         if scores.get("unsafe_execution_rate", 0.0) > 0:
             recs.append("发现未确认业务写操作：阻断发布并检查服务端确认校验")
+        if scores.get("citation_coverage_rate", 1.0) < 1.0:
+            recs.append("RAG 引用覆盖率未达 100%：检查检索结果到最终回答的 citation 透传链路")
         if not recs:
             recs.append("所有指标均达标，继续保持")
         return recs

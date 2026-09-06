@@ -1265,6 +1265,57 @@ a { color: inherit; }
   line-height: 1 !important;
 }
 
+.evaluation-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.metric-card {
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: rgba(17, 19, 26, 0.96);
+}
+
+.metric-card > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.metric-card > strong {
+  display: block;
+  margin: 11px 0 10px;
+  color: var(--text);
+  font-size: 25px;
+}
+
+.metric-card > i {
+  display: block;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.metric-card > i > b { display: block; height: 100%; background: var(--muted); }
+.metric-good > i > b { background: var(--green); }
+.metric-warning > i > b { background: #e3b341; }
+.metric-bad > i > b { background: #ff6b7a; }
+.metric-good { border-color: rgba(70, 211, 154, 0.22); }
+.metric-warning { border-color: rgba(227, 179, 65, 0.26); }
+.metric-bad { border-color: rgba(255, 107, 122, 0.3); }
+
+.metric-card > p {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .score-list {
   display: grid;
   gap: 15px;
@@ -1315,7 +1366,48 @@ a { color: inherit; }
   line-height: 1.55;
 }
 
+.regression-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.regression-list p {
+  margin: 0;
+  padding: 10px 12px;
+  border-left: 3px solid #ff6b7a;
+  background: rgba(255, 107, 122, 0.08);
+  color: #ffc4ca;
+  font-size: 12px;
+}
+
+.evaluation-cases { margin-top: 18px; }
+.case-list { display: grid; }
+
+.case-item {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr) auto;
+  gap: 13px;
+  align-items: center;
+  padding: 13px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.case-status {
+  padding: 4px 6px;
+  border-radius: 5px;
+  text-align: center;
+  font: 10px/1 "SFMono-Regular", Consolas, monospace;
+}
+
+.case-pass { color: var(--green); background: rgba(70, 211, 154, 0.1); }
+.case-fail { color: #ff8c98; background: rgba(255, 107, 122, 0.1); }
+.case-item strong { color: var(--text); font-size: 12px; }
+.case-item p { margin: 4px 0 0; color: var(--muted); font-size: 11px; }
+.case-item > small { color: var(--text-soft); font: 10px/1.4 "SFMono-Regular", Consolas, monospace; }
+
 @media (max-width: 1120px) {
+  .evaluation-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .topbar {
     grid-template-columns: 1fr auto;
     padding: 10px 22px 6px;
@@ -1398,7 +1490,10 @@ a { color: inherit; }
   .side-actions { flex-direction: column; }
   .search-line button { width: 100%; }
   .evaluation-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .evaluation-metrics { grid-template-columns: 1fr; }
   .score-hero { grid-column: 1 / -1; }
+  .case-item { grid-template-columns: 48px minmax(0, 1fr); }
+  .case-item > small { grid-column: 2; }
   .skill-item { grid-template-columns: 9px minmax(0, 1fr) auto; }
   .skill-item > span:not(.skill-dot) { grid-column: 2 / -1; grid-row: 2; }
   .skill-item small { grid-column: 3; grid-row: 1; }

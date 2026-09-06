@@ -350,19 +350,42 @@
           <div><span>总数</span><strong>{{ evalData.total }}</strong></div>
           <div><span>回归</span><strong :class="evalData.regressions?.length ? 'danger' : 'success'">{{ evalData.regressions?.length || 0 }}</strong></div>
         </div>
+
+        <div class="evaluation-metrics">
+          <article v-for="metric in evaluationMetrics" :key="metric.key" class="metric-card" :class="`metric-${metric.tone}`">
+            <div><span>{{ metric.label }}</span><small>{{ metric.target }}</small></div>
+            <strong>{{ metric.display }}</strong>
+            <i><b :style="{ width: `${metric.bar}%` }"></b></i>
+            <p>{{ metric.description }}</p>
+          </article>
+        </div>
+
         <div class="evaluation-layout">
           <section class="workspace-card">
-            <div class="card-heading"><div><span class="kicker">Scores</span><h2>平均评分</h2></div></div>
+            <div class="card-heading"><div><span class="kicker">Quality scores</span><h2>回答质量</h2></div></div>
             <div class="score-list">
-              <div v-for="(value, key) in evalData.avg_scores" :key="key"><span>{{ key }}</span><i><b :style="{ width: `${scoreBarWidth(key, value)}%` }"></b></i><strong>{{ Number(value).toFixed(2) }}</strong></div>
+              <div v-for="(value, key) in secondaryScores" :key="key"><span>{{ scoreLabel(key) }}</span><i><b :style="{ width: `${scoreBarWidth(key, value)}%` }"></b></i><strong>{{ Number(value).toFixed(2) }}</strong></div>
+              <div v-if="!Object.keys(secondaryScores).length" class="workspace-empty">本轮未运行 LLM 回答质量评测。</div>
             </div>
           </section>
           <section class="workspace-card">
             <div class="card-heading"><div><span class="kicker">Recommendations</span><h2>优化建议</h2></div></div>
+            <div v-if="evalData.regressions?.length" class="regression-list"><p v-for="(item, index) in evalData.regressions" :key="`regression-${index}`">回归：{{ item }}</p></div>
             <div v-if="evalData.recommendations?.length" class="recommendations"><p v-for="(item, index) in evalData.recommendations" :key="index">{{ item }}</p></div>
             <div v-else class="workspace-empty">本次评测没有返回额外建议。</div>
           </section>
         </div>
+
+        <section class="workspace-card evaluation-cases">
+          <div class="card-heading"><div><span class="kicker">Test evidence</span><h2>用例证据</h2></div><small>{{ evalData.results?.length || 0 }} cases</small></div>
+          <div class="case-list">
+            <article v-for="item in evalData.results" :key="item.test_id" class="case-item">
+              <span class="case-status" :class="item.passed ? 'case-pass' : 'case-fail'">{{ item.passed ? 'PASS' : 'FAIL' }}</span>
+              <div><strong>{{ testCaseLabel(item.test_id) }}</strong><p>{{ item.detail || '未提供详情' }}</p></div>
+              <small>{{ compactScores(item.scores) }}</small>
+            </article>
+          </div>
+        </section>
       </div>
       <div v-else class="evaluation-empty"><div class="empty-symbol">◎</div><h2>还没有评测结果</h2><p>点击右上角运行一次评测。</p></div>
     </section>
@@ -426,6 +449,25 @@ const userInitial = computed(() => (settings.userId || 'U').slice(0, 1).toUpperC
 const activeAlerts = computed(() => monitorData.value.active_alerts || [])
 const agentCount = computed(() => Object.keys(monitorData.value.agent_stats || {}).length)
 const totalRequests = computed(() => Object.values(monitorData.value.agent_stats || {}).reduce((sum, item) => sum + Number(item.total || 0), 0))
+const primaryMetricKeys = new Set([
+  'task_completion_rate', 'tool_selection_accuracy', 'unsafe_execution_rate',
+  'citation_coverage_rate', 'business_p95_latency_ms', 'intent_accuracy',
+  'business_case_pass_rate', 'confirmation_guard_rate', 'ticket_persistence_rate'
+])
+const secondaryScores = computed(() => Object.fromEntries(
+  Object.entries(evalData.value?.avg_scores || {}).filter(([key]) => !primaryMetricKeys.has(key))
+))
+const evaluationMetrics = computed(() => {
+  const scores = evalData.value?.avg_scores || {}
+  return [
+    buildMetric(scores, 'task_completion_rate', '任务完成率', '目标 ≥ 95%', '多轮业务是否真正完成', 0.95),
+    buildMetric(scores, 'tool_selection_accuracy', '工具选择准确率', '目标 ≥ 95%', '是否调用正确的业务工具', 0.95),
+    buildMetric(scores, 'unsafe_execution_rate', '未确认执行率', '目标 = 0%', '无确认时是否发生写操作', 0, true),
+    buildMetric(scores, 'citation_coverage_rate', 'RAG 引用覆盖率', '目标 = 100%', '检索型回答是否携带依据', 1),
+    buildMetric(scores, 'business_p95_latency_ms', '业务 P95 延迟', '目标 ≤ 500ms', '确定性业务工作流尾延迟', 500, true, 'latency'),
+    buildMetric(scores, 'intent_accuracy', '意图识别准确率', '目标 ≥ 90%', '路由前的意图分类质量', 0.9)
+  ]
+})
 
 watch(() => settings.conversationId, persist)
 onMounted(() => {
@@ -615,6 +657,44 @@ function scoreBarWidth(key, value) {
   if (String(key).includes('latency_ms')) return Math.max(0, 100 - Math.min(number, 2000) / 20)
   if (key === 'unsafe_execution_rate') return Math.max(0, 100 - number * 100)
   return Math.min(Math.max(number * 100, 0), 100)
+}
+
+function buildMetric(scores, key, label, target, description, threshold, lowerIsBetter = false, type = 'rate') {
+  const raw = scores[key]
+  if (raw === undefined || raw === null) {
+    return { key, label, target, description: `${description}（本轮未采集）`, display: 'N/A', bar: 0, tone: 'neutral' }
+  }
+  const value = Number(raw)
+  const passed = lowerIsBetter ? value <= threshold : value >= threshold
+  const warning = lowerIsBetter ? value <= threshold * 1.25 : value >= threshold * 0.85
+  const bar = type === 'latency'
+    ? Math.max(0, 100 - Math.min(value, threshold * 2) / (threshold * 2) * 100)
+    : (lowerIsBetter ? Math.max(0, 100 - value * 100) : Math.min(100, value * 100))
+  return {
+    key, label, target, description,
+    display: type === 'latency' ? `${value.toFixed(1)} ms` : formatPercent(value),
+    bar, tone: passed ? 'good' : (warning ? 'warning' : 'bad')
+  }
+}
+
+function scoreLabel(key) {
+  return ({ relevance: '相关性', accuracy: '准确性', completeness: '完整性', helpfulness: '有用性', dialog_intent_match: '路由命中' })[key] || key
+}
+
+function testCaseLabel(testId) {
+  const labels = {
+    intent_recognition: '意图识别',
+    business_refund_multiturn: '多轮退款闭环',
+    business_cancel_no_side_effect: '取消操作无副作用',
+    business_confirmation_guard: '高风险确认防线',
+    business_ticket_persistence: '人工工单持久化'
+  }
+  return labels[testId] || testId.replaceAll('_', ' ')
+}
+
+function compactScores(scores = {}) {
+  const entries = Object.entries(scores).slice(0, 3)
+  return entries.length ? entries.map(([key, value]) => `${scoreLabel(key)} ${Number(value).toFixed(2)}`).join(' · ') : '—'
 }
 
 function formatJson(value) {
