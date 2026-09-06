@@ -26,7 +26,10 @@ _INTENT_HINTS = {
     IntentCategory.PAYMENT_ISSUE: ("重复扣款", "扣了两次", "扣款", "多扣", "支付失败"),
     IntentCategory.TECHNICAL_LOGIN: ("无法登录", "登录失败", "401", "验证码", "登录"),
     IntentCategory.TECHNICAL_CRASH: ("崩溃", "闪退", "500", "报错"),
-    IntentCategory.ORDER_STATUS: ("订单状态", "未完成订单", "有没有发货", "是否发货"),
+    IntentCategory.ORDER_STATUS: (
+        "订单状态", "未完成订单", "有没有发货", "是否发货", "未发货", "没发货",
+        "已支付但", "订单已经支付", "支付后还没有发货",
+    ),
     IntentCategory.LOGISTICS: ("物流", "快递", "配送", "运单"),
     IntentCategory.ACCOUNT: ("注销账户", "修改账户", "绑定手机号", "账户"),
     IntentCategory.HUMAN_HANDOFF: ("转人工", "人工客服", "人工主管", "升级处理"),
@@ -46,6 +49,7 @@ class TaskIntentTracker:
         previous = previous if isinstance(previous, dict) else {}
         primary = self._valid_intents(previous.get("primary_intents", []))
         discovered = self.detect_intents(message)
+        explicit_discovered = list(discovered)
         if current_intent in TRACKED_INTENTS:
             discovered.insert(0, current_intent)
         for intent in discovered:
@@ -53,12 +57,14 @@ class TaskIntentTracker:
                 primary.append(intent.value)
 
         previous_active = str(previous.get("active_intent") or "")
-        if current_intent in TRACKED_INTENTS:
+        if explicit_discovered and current_intent in explicit_discovered:
             active = current_intent.value
-        elif discovered:
+        elif explicit_discovered:
             # LLM 偶尔会把显式的复合业务请求归为 other/query；确定性关键词用于
             # 路由兜底，但 turn_intent 仍保留原始模型判断，方便审计与评测。
-            active = discovered[0].value
+            active = explicit_discovered[0].value
+        elif current_intent in TRACKED_INTENTS:
+            active = current_intent.value
         elif previous_active:
             # “那怎么办/需要多久”之类省略主语的追问继续当前任务。
             active = previous_active

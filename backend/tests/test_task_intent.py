@@ -62,3 +62,12 @@ def test_stolen_account_remains_account_security():
         {},
     )
     assert intent == IntentCategory.ACCOUNT_SECURITY
+
+
+def test_explicit_new_order_status_switch_wins_over_stale_model_intent():
+    tracker = TaskIntentTracker()
+    state = tracker.update(None, IntentCategory.REFUND, "我想退款并申请发票")
+    state = tracker.update(state, IntentCategory.REFUND, "订单已经支付但还没有发货")
+    assert state["turn_intent"] == "refund"
+    assert state["active_intent"] == "order_status"
+    assert {"refund", "invoice", "order_status"} <= set(state["primary_intents"])
