@@ -71,7 +71,7 @@ flowchart LR
 - `intent_cases.json`：120 条中文意图分类样本，覆盖 12 个核心类别，每类 10 条。
 - `dialog_cases.json`：20 组单轮和多轮对话样本，其中包含退款、发票、物流、支付异常、登录故障和复合问题。
 
-运行 `POST /eval/run` 时默认加载这两份数据。意图评测输出 Accuracy、Macro-F1 和分类型结果；对话评测由 LLM-as-Judge 输出相关性、准确性、完整性、可执行性和综合得分，并与历史 baseline 做回归比较。评测还会在隔离的临时 SQLite 中执行退款、取消和工单闭环，输出：
+运行 `POST /eval/run` 时默认加载这两份数据。意图评测输出 Accuracy、Macro-F1 和分类型结果；对话评测由 LLM-as-Judge 输出相关性、准确性、完整性、可执行性和综合得分，并与显式保存的 baseline 做回归比较。前端可将最近一次评测“设为基线”，服务端通过报告时间戳校验避免误覆盖。评测还会在隔离的临时 SQLite 中执行退款、取消和工单闭环，输出：
 
 - `task_completion_rate`：业务任务是否真正完成。
 - `tool_selection_accuracy`：工作流是否调用了预期工具。
@@ -211,6 +211,8 @@ curl -X POST http://127.0.0.1:8000/chat \
 | `POST` | `/demo/reset` | 仅开发环境恢复演示订单、退款和工单 |
 | `GET` | `/monitor` | 查看 Agent 和工具运行指标 |
 | `POST` | `/eval/run` | 执行端到端评测 |
+| `GET` | `/eval/baseline` | 查询当前回归基线及失败证据 |
+| `POST` | `/eval/baseline/promote` | 将最近一次评测显式设为基线 |
 | `GET` | `/skills` | 查看已加载的 Skills |
 
 知识文档可以携带版本生命周期元数据：

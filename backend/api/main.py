@@ -621,6 +621,10 @@ class EvalRunInput(BaseModel):
     dialog_cases: Optional[List[EvalDialogInput]] = Field(default=None, max_length=100)
 
 
+class EvalBaselinePromoteInput(BaseModel):
+    report_timestamp: str = Field(min_length=1, max_length=64)
+
+
 @app.post("/knowledge/add", tags=["知识库"])
 async def add_knowledge(body: BatchDocInput):
     """
@@ -817,14 +821,21 @@ async def run_eval(body: Optional[EvalRunInput] = None):
         intent_cases=intent_cases,
         dialog_cases=dialog_cases,
     )
-    return {
+    return _eval_report_payload(report, include_results=True)
+
+
+def _eval_report_payload(report: Any, *, include_results: bool) -> Dict[str, Any]:
+    payload = {
+        "timestamp":       report.timestamp,
         "pass_rate":       report.pass_rate,
         "total":           report.total,
         "passed":          report.passed,
         "avg_scores":      report.avg_scores,
         "regressions":     report.regressions,
         "recommendations": report.recommendations,
-        "results": [
+    }
+    if include_results:
+        payload["results"] = [
             {
                 "test_id": r.test_id,
                 "passed": r.passed,
@@ -833,7 +844,35 @@ async def run_eval(body: Optional[EvalRunInput] = None):
                 "metadata": r.metadata,
             }
             for r in report.results
-        ],
+        ]
+    return payload
+
+
+@app.get("/eval/baseline", tags=["评测"])
+async def get_eval_baseline():
+    """读取当前回归基线及失败分析证据。"""
+    if _evaluator is None:
+        raise HTTPException(503, "服务未就绪")
+    baseline = _evaluator.baseline
+    if baseline is None:
+        return {"exists": False, "baseline": None}
+    return {"exists": True, "baseline": _eval_report_payload(baseline, include_results=True)}
+
+
+@app.post("/eval/baseline/promote", tags=["评测"])
+async def promote_eval_baseline(body: EvalBaselinePromoteInput):
+    """将当前进程最近一次评测显式提升为回归基线。"""
+    if _evaluator is None:
+        raise HTTPException(503, "服务未就绪")
+    try:
+        baseline = _evaluator.promote_latest_baseline(body.report_timestamp)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    return {
+        "message": "当前评测已设为回归基线",
+        "baseline": _eval_report_payload(baseline, include_results=False),
     }
 
 

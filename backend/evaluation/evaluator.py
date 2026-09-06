@@ -503,6 +503,27 @@ class EndToEndEvaluator:
     def history(self) -> List[EvalReport]:
         return self._history
 
+    @property
+    def baseline(self) -> Optional[EvalReport]:
+        return self._baseline
+
+    @property
+    def latest_report(self) -> Optional[EvalReport]:
+        return self._history[-1] if self._history else None
+
+    def promote_latest_baseline(self, expected_timestamp: Optional[str] = None) -> EvalReport:
+        """显式将最近一次评测设为基线，时间戳用于防止覆盖错报告。"""
+        report = self.latest_report
+        if report is None:
+            raise ValueError("当前进程还没有可提升的评测报告")
+        if expected_timestamp and report.timestamp != expected_timestamp:
+            raise ValueError("评测报告已变化，请刷新后重试")
+        if not self._baseline_path:
+            raise RuntimeError("未配置评测基线存储路径")
+        if not self._save_baseline(report):
+            raise RuntimeError("评测基线保存失败")
+        return report
+
     def _load_baseline(self) -> Optional[EvalReport]:
         if not self._baseline_path or not self._baseline_path.exists():
             return None
@@ -513,18 +534,22 @@ class EndToEndEvaluator:
             logger.warning(f"读取评测基线失败: {ex}")
             return None
 
-    def _save_baseline(self, report: EvalReport) -> None:
+    def _save_baseline(self, report: EvalReport) -> bool:
         if not self._baseline_path:
-            return
+            return False
         try:
             self._baseline_path.parent.mkdir(parents=True, exist_ok=True)
-            self._baseline_path.write_text(
+            temporary_path = self._baseline_path.with_suffix(self._baseline_path.suffix + ".tmp")
+            temporary_path.write_text(
                 json.dumps(asdict(report), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            temporary_path.replace(self._baseline_path)
             self._baseline = report
+            return True
         except Exception as ex:
             logger.warning(f"保存评测基线失败: {ex}")
+            return False
 
     @staticmethod
     def _report_from_dict(data: Dict[str, Any]) -> EvalReport:

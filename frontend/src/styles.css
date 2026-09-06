@@ -356,6 +356,7 @@ a { color: inherit; }
 
 .quiet-button,
 .link-button,
+.secondary-button,
 .upload-button {
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.03);
@@ -365,6 +366,7 @@ a { color: inherit; }
 
 .quiet-button:hover:not(:disabled),
 .link-button:hover:not(:disabled),
+.secondary-button:hover:not(:disabled),
 .upload-button:hover {
   border-color: var(--line-strong);
   background: rgba(255, 255, 255, 0.06);
@@ -1265,6 +1267,22 @@ a { color: inherit; }
   line-height: 1 !important;
 }
 
+.baseline-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 14px;
+  padding: 13px 16px;
+  border: 1px solid rgba(111, 120, 247, 0.24);
+  border-radius: 13px;
+  background: rgba(111, 120, 247, 0.07);
+}
+
+.baseline-strip strong { display: block; margin-top: 3px; color: var(--text); font-size: 12px; }
+.baseline-strip p { margin: 0; color: var(--muted); font-size: 11px; }
+.baseline-empty { border-style: dashed; background: rgba(255, 255, 255, 0.02); }
+
 .evaluation-metrics {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1286,6 +1304,10 @@ a { color: inherit; }
   color: var(--muted);
   font-size: 11px;
 }
+
+.metric-card .delta-up { color: var(--green); }
+.metric-card .delta-down { color: #ff8c98; }
+.metric-card .delta-flat { color: var(--muted); }
 
 .metric-card > strong {
   display: block;
@@ -1406,6 +1428,21 @@ a { color: inherit; }
 .case-item p { margin: 4px 0 0; color: var(--muted); font-size: 11px; }
 .case-item > small { color: var(--text-soft); font: 10px/1.4 "SFMono-Regular", Consolas, monospace; }
 
+.failure-detail { margin-top: 8px; }
+.failure-detail summary { cursor: pointer; color: #ff9aa5; font-size: 11px; }
+.failure-detail pre {
+  max-height: 260px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 10px;
+  border: 1px solid rgba(255, 107, 122, 0.2);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.18);
+  color: var(--text-soft);
+  white-space: pre-wrap;
+  font: 10px/1.5 "SFMono-Regular", Consolas, monospace;
+}
+
 @media (max-width: 1120px) {
   .evaluation-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .topbar {
@@ -1491,6 +1528,7 @@ a { color: inherit; }
   .search-line button { width: 100%; }
   .evaluation-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .evaluation-metrics { grid-template-columns: 1fr; }
+  .baseline-strip { align-items: flex-start; flex-direction: column; }
   .score-hero { grid-column: 1 / -1; }
   .case-item { grid-template-columns: 48px minmax(0, 1fr); }
   .case-item > small { grid-column: 2; }

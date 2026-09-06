@@ -340,20 +340,27 @@
           <h1>评测 Agent</h1>
           <p>运行 FastAPI 内置评测，查看意图识别、对话质量和回归结果。</p>
         </div>
-        <button @click="runEvaluation" :disabled="busy">{{ busy ? '运行中...' : '运行评测' }}</button>
+        <div class="heading-actions">
+          <button class="secondary-button" @click="promoteCurrentBaseline" :disabled="busy || !evalData?.timestamp">设为基线</button>
+          <button @click="runEvaluation" :disabled="busy">{{ busy ? '运行中...' : '运行完整评测' }}</button>
+        </div>
       </div>
 
-      <div v-if="evalData" class="evaluation-content">
+      <div v-if="displayedEval" class="evaluation-content">
+        <div class="baseline-strip" :class="{ 'baseline-empty': !evalBaseline }">
+          <div><span class="kicker">Regression baseline</span><strong>{{ evalBaseline ? `基线 ${formatDateTime(evalBaseline.timestamp)}` : '尚未设置回归基线' }}</strong></div>
+          <p>{{ evalBaseline ? (evalData ? `基线通过率 ${formatPercent(evalBaseline.pass_rate)}，当前指标变化显示在卡片右上角。` : '当前展示已持久化的正式基线，运行新评测后可查看指标变化。') : '运行评测后点击“设为基线”，后续结果才会产生可信的回归比较。' }}</p>
+        </div>
         <div class="evaluation-summary">
-          <div class="score-hero"><span>Pass rate</span><strong>{{ formatPercent(evalData.pass_rate) }}</strong><small>{{ evalData.passed }} / {{ evalData.total }} cases passed</small></div>
-          <div><span>通过</span><strong>{{ evalData.passed }}</strong></div>
-          <div><span>总数</span><strong>{{ evalData.total }}</strong></div>
-          <div><span>回归</span><strong :class="evalData.regressions?.length ? 'danger' : 'success'">{{ evalData.regressions?.length || 0 }}</strong></div>
+          <div class="score-hero"><span>{{ evalData ? 'Current pass rate' : 'Baseline pass rate' }}</span><strong>{{ formatPercent(displayedEval.pass_rate) }}</strong><small>{{ displayedEval.passed }} / {{ displayedEval.total }} cases passed</small></div>
+          <div><span>通过</span><strong>{{ displayedEval.passed }}</strong></div>
+          <div><span>总数</span><strong>{{ displayedEval.total }}</strong></div>
+          <div><span>回归</span><strong :class="displayedEval.regressions?.length ? 'danger' : 'success'">{{ displayedEval.regressions?.length || 0 }}</strong></div>
         </div>
 
         <div class="evaluation-metrics">
           <article v-for="metric in evaluationMetrics" :key="metric.key" class="metric-card" :class="`metric-${metric.tone}`">
-            <div><span>{{ metric.label }}</span><small>{{ metric.target }}</small></div>
+            <div><span>{{ metric.label }}</span><small :class="metric.deltaTone">{{ metric.deltaLabel || metric.target }}</small></div>
             <strong>{{ metric.display }}</strong>
             <i><b :style="{ width: `${metric.bar}%` }"></b></i>
             <p>{{ metric.description }}</p>
@@ -370,18 +377,24 @@
           </section>
           <section class="workspace-card">
             <div class="card-heading"><div><span class="kicker">Recommendations</span><h2>优化建议</h2></div></div>
-            <div v-if="evalData.regressions?.length" class="regression-list"><p v-for="(item, index) in evalData.regressions" :key="`regression-${index}`">回归：{{ item }}</p></div>
-            <div v-if="evalData.recommendations?.length" class="recommendations"><p v-for="(item, index) in evalData.recommendations" :key="index">{{ item }}</p></div>
+            <div v-if="displayedEval.regressions?.length" class="regression-list"><p v-for="(item, index) in displayedEval.regressions" :key="`regression-${index}`">回归：{{ item }}</p></div>
+            <div v-if="displayedEval.recommendations?.length" class="recommendations"><p v-for="(item, index) in displayedEval.recommendations" :key="index">{{ item }}</p></div>
             <div v-else class="workspace-empty">本次评测没有返回额外建议。</div>
           </section>
         </div>
 
         <section class="workspace-card evaluation-cases">
-          <div class="card-heading"><div><span class="kicker">Test evidence</span><h2>用例证据</h2></div><small>{{ evalData.results?.length || 0 }} cases</small></div>
+          <div class="card-heading"><div><span class="kicker">Test evidence</span><h2>用例证据</h2></div><small>{{ displayedEval.results?.length || 0 }} cases</small></div>
           <div class="case-list">
-            <article v-for="item in evalData.results" :key="item.test_id" class="case-item">
+            <article v-for="item in displayedEval.results" :key="item.test_id" class="case-item">
               <span class="case-status" :class="item.passed ? 'case-pass' : 'case-fail'">{{ item.passed ? 'PASS' : 'FAIL' }}</span>
-              <div><strong>{{ testCaseLabel(item.test_id) }}</strong><p>{{ item.detail || '未提供详情' }}</p></div>
+              <div>
+                <strong>{{ testCaseLabel(item.test_id) }}</strong><p>{{ item.detail || '未提供详情' }}</p>
+                <details v-if="!item.passed" class="failure-detail">
+                  <summary>查看失败上下文</summary>
+                  <pre>{{ failureEvidence(item) }}</pre>
+                </details>
+              </div>
               <small>{{ compactScores(item.scores) }}</small>
             </article>
           </div>
@@ -401,12 +414,14 @@ import {
   reloadSkills,
   requestChat,
   requestHealth,
+  requestEvaluationBaseline,
   requestKnowledgeStats,
   requestMonitor,
   requestSearch,
   requestToolTrace,
   requestSkills,
   resetDemo,
+  promoteEvaluationBaseline,
   runEvaluation as requestEvaluation,
   saveSettings,
   uploadKnowledge
@@ -431,6 +446,8 @@ const skillsData = ref({ count: 0, skills: [], errors: [] })
 const lastResponse = ref(null)
 const lastTrace = ref(null)
 const evalData = ref(null)
+const evalBaseline = ref(null)
+const displayedEval = computed(() => evalData.value || evalBaseline.value)
 const toast = ref('')
 const starterQuestions = [
   { category: '退款', question: '我想申请退款，订单号是 #12345', description: '查询退款条件、处理流程和预计到账时间' },
@@ -455,10 +472,10 @@ const primaryMetricKeys = new Set([
   'business_case_pass_rate', 'confirmation_guard_rate', 'ticket_persistence_rate'
 ])
 const secondaryScores = computed(() => Object.fromEntries(
-  Object.entries(evalData.value?.avg_scores || {}).filter(([key]) => !primaryMetricKeys.has(key))
+  Object.entries(displayedEval.value?.avg_scores || {}).filter(([key]) => !primaryMetricKeys.has(key))
 ))
 const evaluationMetrics = computed(() => {
-  const scores = evalData.value?.avg_scores || {}
+  const scores = displayedEval.value?.avg_scores || {}
   return [
     buildMetric(scores, 'task_completion_rate', '任务完成率', '目标 ≥ 95%', '多轮业务是否真正完成', 0.95),
     buildMetric(scores, 'tool_selection_accuracy', '工具选择准确率', '目标 ≥ 95%', '是否调用正确的业务工具', 0.95),
@@ -477,7 +494,7 @@ onMounted(() => {
 function persist() { saveSettings(settings) }
 
 async function refreshConsole() {
-  await Promise.allSettled([checkHealth(), loadStats(), loadMonitor(), loadSkills()])
+  await Promise.allSettled([checkHealth(), loadStats(), loadMonitor(), loadSkills(), loadEvaluationBaseline()])
 }
 
 async function checkHealth() {
@@ -632,10 +649,33 @@ async function runEvaluation() {
   busy.value = true
   try {
     evalData.value = await requestEvaluation(settings.backend, settings)
+    await loadEvaluationBaseline()
     showToast('评测完成')
   } catch (error) {
     statusText.value = error.message
     showToast('评测运行失败')
+  } finally { busy.value = false }
+}
+
+async function loadEvaluationBaseline() {
+  try {
+    const data = await requestEvaluationBaseline(settings.backend, settings)
+    evalBaseline.value = data.exists ? data.baseline : null
+  } catch {
+    evalBaseline.value = null
+  }
+}
+
+async function promoteCurrentBaseline() {
+  if (!evalData.value?.timestamp || busy.value) return
+  busy.value = true
+  try {
+    const data = await promoteEvaluationBaseline(settings.backend, settings, evalData.value.timestamp)
+    evalBaseline.value = data.baseline
+    showToast('当前评测已设为回归基线')
+  } catch (error) {
+    statusText.value = error.message
+    showToast('基线保存失败，请重新运行评测')
   } finally { busy.value = false }
 }
 
@@ -662,9 +702,13 @@ function scoreBarWidth(key, value) {
 function buildMetric(scores, key, label, target, description, threshold, lowerIsBetter = false, type = 'rate') {
   const raw = scores[key]
   if (raw === undefined || raw === null) {
-    return { key, label, target, description: `${description}（本轮未采集）`, display: 'N/A', bar: 0, tone: 'neutral' }
+    return { key, label, target, description: `${description}（本轮未采集）`, display: 'N/A', bar: 0, tone: 'neutral', deltaLabel: '', deltaTone: '' }
   }
   const value = Number(raw)
+  const baselineRaw = evalData.value ? evalBaseline.value?.avg_scores?.[key] : undefined
+  const hasBaseline = baselineRaw !== undefined && baselineRaw !== null
+  const delta = hasBaseline ? value - Number(baselineRaw) : null
+  const improved = delta === null || delta === 0 ? null : (lowerIsBetter ? delta < 0 : delta > 0)
   const passed = lowerIsBetter ? value <= threshold : value >= threshold
   const warning = lowerIsBetter ? value <= threshold * 1.25 : value >= threshold * 0.85
   const bar = type === 'latency'
@@ -673,8 +717,18 @@ function buildMetric(scores, key, label, target, description, threshold, lowerIs
   return {
     key, label, target, description,
     display: type === 'latency' ? `${value.toFixed(1)} ms` : formatPercent(value),
-    bar, tone: passed ? 'good' : (warning ? 'warning' : 'bad')
+    bar, tone: passed ? 'good' : (warning ? 'warning' : 'bad'),
+    deltaLabel: delta === null ? '' : formatMetricDelta(delta, type),
+    deltaTone: improved === null ? 'delta-flat' : (improved ? 'delta-up' : 'delta-down')
   }
+}
+
+function formatMetricDelta(delta, type) {
+  if (Math.abs(delta) < 0.00005) return '较基线持平'
+  const sign = delta > 0 ? '+' : ''
+  return type === 'latency'
+    ? `较基线 ${sign}${delta.toFixed(1)}ms`
+    : `较基线 ${sign}${(delta * 100).toFixed(1)}pp`
 }
 
 function scoreLabel(key) {
@@ -695,6 +749,30 @@ function testCaseLabel(testId) {
 function compactScores(scores = {}) {
   const entries = Object.entries(scores).slice(0, 3)
   return entries.length ? entries.map(([key, value]) => `${scoreLabel(key)} ${Number(value).toFixed(2)}`).join(' · ') : '—'
+}
+
+function formatDateTime(value) {
+  if (!value) return '-'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false })
+}
+
+function failureEvidence(item) {
+  const metadata = item?.metadata || {}
+  if (Array.isArray(metadata.cases)) {
+    const failures = metadata.cases.filter(entry => entry.expected !== entry.predicted).slice(0, 8)
+    return failures.length ? JSON.stringify(failures, null, 2) : '没有可展示的分类失败明细。'
+  }
+  const evidence = {
+    question: metadata.question,
+    response: metadata.response,
+    expected_intent: metadata.expected_intent,
+    actual_intent: metadata.intent,
+    tools_used: metadata.tools_used,
+    citation_count: metadata.citation_count,
+    judge_error: metadata.judge_error
+  }
+  return JSON.stringify(Object.fromEntries(Object.entries(evidence).filter(([, value]) => value !== undefined && value !== null)), null, 2)
 }
 
 function formatJson(value) {

@@ -59,6 +59,18 @@ export async function runEvaluation(type, settings, body = null) {
   })
 }
 
+export async function requestEvaluationBaseline(type, settings) {
+  return requestJson(backendMeta(type, settings).baseUrl, '/eval/baseline')
+}
+
+export async function promoteEvaluationBaseline(type, settings, reportTimestamp) {
+  return requestJson(backendMeta(type, settings).baseUrl, '/eval/baseline/promote', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ report_timestamp: reportTimestamp })
+  })
+}
+
 export async function requestSearch(type, settings, query, topK = 5) {
   const params = new URLSearchParams({ query, top_k: String(topK) })
   return requestJson(backendMeta(type, settings).baseUrl, `/search?${params}`, { method: 'POST' })
