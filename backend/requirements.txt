@@ -2,7 +2,7 @@
 
 # ── AI / LLM ──────────────────────────────────────────────────────────────────
 anthropic==0.40.0          # LLM 调用；意图 Embedding 分支支持远端客户端，缺失时本地兜底
-openai>=1.109.1,<2        # DeepSeek 原生 OpenAI-compatible Tool Calling
+openai>=1.109.1,<2        # Qwen / DeepSeek OpenAI-compatible Tool Calling
 
 # ── Web 框架 ──────────────────────────────────────────────────────────────────
 fastapi==0.115.5

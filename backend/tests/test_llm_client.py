@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 from core.llm_client import (
@@ -62,3 +63,24 @@ def test_openai_tool_response_converts_to_internal_tool_use_block():
     assert block.type == "tool_use"
     assert block.id == "call_1"
     assert block.input == {"query": "发票"}
+
+
+def test_qwen_uses_its_own_non_thinking_parameter(monkeypatch):
+    from core.llm_client import OpenAICompatibleMessages
+
+    captured = {}
+
+    async def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=[]))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setenv("QWEN_THINKING", "disabled")
+    messages = OpenAICompatibleMessages(client, provider="qwen")
+    asyncio.run(messages.create(
+        model="qwen3.7-plus",
+        messages=[{"role": "user", "content": "hello"}],
+    ))
+
+    assert captured["extra_body"] == {"enable_thinking": False}
+    assert "thinking" not in captured["extra_body"]

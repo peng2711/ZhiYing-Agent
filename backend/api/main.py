@@ -62,7 +62,7 @@ def _llm_cfg() -> Dict[str, Any]:
         raise RuntimeError("未设置有效的 LLM_API_KEY")
     cfg: Dict[str, Any] = {
         "api_key":  key,
-        "model":    os.getenv("LLM_MODEL", "deepseek-v4-pro").strip(),
+        "model":    os.getenv("LLM_MODEL", "qwen3.7-plus").strip(),
     }
     base_url = os.getenv("LLM_BASE_URL", "").strip()
     if base_url:

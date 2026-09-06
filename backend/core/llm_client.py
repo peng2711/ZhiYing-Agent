@@ -1,9 +1,8 @@
 """LLM client adapters used by ZhiYing Agent.
 
-The application historically used Anthropic's Messages API shape internally.
-DeepSeek's native API is OpenAI-compatible, so this module translates between
-the two shapes and lets the existing Agent/RAG code keep its Anthropic-style
-tool loop.
+The application uses an Anthropic-style message shape internally and translates
+OpenAI-compatible Qwen/DeepSeek responses so the Agent/RAG tool loop stays
+provider-independent.
 """
 
 from __future__ import annotations
@@ -177,9 +176,10 @@ def openai_response_to_anthropic(response: Any) -> LLMMessageResponse:
     return LLMMessageResponse(content=content, raw=response)
 
 
-class DeepSeekMessages:
-    def __init__(self, client: AsyncOpenAI):
+class OpenAICompatibleMessages:
+    def __init__(self, client: AsyncOpenAI, provider: str = "openai"):
         self._client = client
+        self._provider = provider
 
     async def create(self, **kwargs: Any) -> LLMMessageResponse:
         system = kwargs.pop("system", None)
@@ -187,15 +187,16 @@ class DeepSeekMessages:
         tools = kwargs.pop("tools", None)
         tool_choice = kwargs.pop("tool_choice", None)
         extra_body = dict(kwargs.pop("extra_body", {}) or {})
-        # DeepSeek V4 enables Thinking Mode by default. In that mode the API
-        # rejects a named tool_choice, while ZhiYing deliberately forces RAG
-        # for fact intents. Disable thinking by default for deterministic
-        # function-calling; callers can opt in once reasoning_content round
-        # tripping is implemented.
-        extra_body.setdefault(
-            "thinking",
-            {"type": os.getenv("DEEPSEEK_THINKING", "disabled").strip().lower() or "disabled"},
-        )
+        if self._provider == "deepseek":
+            # DeepSeek V4 的思考模式与强制命名工具调用组合存在限制。
+            extra_body.setdefault(
+                "thinking",
+                {"type": os.getenv("DEEPSEEK_THINKING", "disabled").strip().lower() or "disabled"},
+            )
+        elif self._provider == "qwen":
+            # 千问使用 enable_thinking，而不是 DeepSeek 的 thinking 对象。
+            qwen_thinking = os.getenv("QWEN_THINKING", "disabled").strip().lower()
+            extra_body.setdefault("enable_thinking", qwen_thinking in {"1", "true", "yes", "enabled"})
         if tools:
             kwargs["tools"] = anthropic_tools_to_openai(tools)
         if tool_choice is not None:
@@ -208,15 +209,33 @@ class DeepSeekMessages:
         return openai_response_to_anthropic(response)
 
 
-class DeepSeekClient:
-    """Small Anthropic-shaped facade over DeepSeek's native OpenAI API."""
+class OpenAICompatibleClient:
+    """Anthropic-shaped facade over an OpenAI-compatible Chat Completions API."""
 
-    def __init__(self, api_key: str, base_url: Optional[str] = None):
+    def __init__(self, api_key: str, base_url: Optional[str] = None, provider: str = "openai"):
         self._client = AsyncOpenAI(
             api_key=api_key,
-            base_url=(base_url or "https://api.deepseek.com").rstrip("/"),
+            base_url=base_url.rstrip("/") if base_url else None,
         )
-        self.messages = DeepSeekMessages(self._client)
+        self.messages = OpenAICompatibleMessages(self._client, provider=provider)
+
+
+class DeepSeekClient(OpenAICompatibleClient):
+    def __init__(self, api_key: str, base_url: Optional[str] = None):
+        super().__init__(
+            api_key=api_key,
+            base_url=base_url or "https://api.deepseek.com",
+            provider="deepseek",
+        )
+
+
+class QwenClient(OpenAICompatibleClient):
+    def __init__(self, api_key: str, base_url: Optional[str] = None):
+        super().__init__(
+            api_key=api_key,
+            base_url=base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            provider="qwen",
+        )
 
 
 LLMClient = Any
@@ -224,8 +243,12 @@ LLMClient = Any
 
 def create_llm_client(api_key: str, base_url: Optional[str] = None) -> LLMClient:
     provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
-    if provider in {"deepseek", "deepseek_openai", "openai"}:
+    if provider in {"deepseek", "deepseek_openai"}:
         return DeepSeekClient(api_key=api_key, base_url=base_url)
+    if provider in {"qwen", "qwen_openai", "dashscope"}:
+        return QwenClient(api_key=api_key, base_url=base_url)
+    if provider == "openai":
+        return OpenAICompatibleClient(api_key=api_key, base_url=base_url)
 
     kwargs: Dict[str, Any] = {"api_key": api_key}
     if base_url:

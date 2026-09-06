@@ -13,7 +13,7 @@
 
 知应 Agent（ZhiYing Agent）是一个面向中文客服场景的开源 Agent 应用。系统通过细粒度意图识别将请求路由给专业 Agent，由 Agent 按需调用 RAG 工具，并将路由、工具输入、耗时和知识引用呈现在可观测工作台中。
 
-> 当前默认适配 DeepSeek 原生 OpenAI-compatible API。项目使用带持久化和审计能力的 SQLite 模拟订单、退款及工单后台，不连接真实电商或支付系统。
+> 当前默认使用阿里云百炼 `qwen3.7-plus`，并通过 OpenAI-compatible API 完成结构化输出与 Tool Calling。项目使用带持久化和审计能力的 SQLite 模拟订单、退款及工单后台，不连接真实电商或支付系统。
 
 ## 效果展示
 
@@ -100,7 +100,7 @@ flowchart LR
 ## 技术栈
 
 - 后端：Python、FastAPI、Anthropic SDK、OpenAI SDK
-- 模型：DeepSeek 原生 API（可切换 Anthropic-compatible 客户端）
+- 模型：阿里云百炼 Qwen（兼容 DeepSeek、OpenAI-compatible 与 Anthropic 客户端）
 - 数据：Redis、ChromaDB
 - 前端：Vue 3、Vite
 - 监控：Prometheus Client、自定义运行告警
@@ -113,7 +113,7 @@ flowchart LR
 - Python 3.11+
 - Node.js 22+
 - Redis 7（短期记忆需要）
-- DeepSeek API Key
+- 阿里云百炼 API Key
 
 ChromaDB 服务不是本地启动的硬性要求：连接失败时，后端会回退到本地持久化模式。首次使用本地模式时可能下载默认向量模型。
 本地默认连接 `localhost:8001`，回退目录为 `backend/data/chroma`；Docker Compose 内部连接 `chromadb:8000`。
@@ -128,11 +128,11 @@ Copy-Item .env.example .env
 编辑 `backend/.env`，至少填写：
 
 ```env
-LLM_API_KEY=your_deepseek_api_key
-LLM_MODEL=deepseek-v4-pro
-LLM_BASE_URL=https://api.deepseek.com
-LLM_PROVIDER=deepseek_openai
-DEEPSEEK_THINKING=disabled
+LLM_API_KEY=your_dashscope_api_key
+LLM_MODEL=qwen3.7-plus
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_PROVIDER=qwen_openai
+QWEN_THINKING=disabled
 ```
 
 安装依赖并启动：
