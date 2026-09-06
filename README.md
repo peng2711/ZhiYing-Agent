@@ -186,6 +186,9 @@ cp backend/.env.example backend/.env
 docker compose up --build
 ```
 
+Docker 前端通过同源 Nginx 代理访问后端，代理从 `backend/.env` 读取
+`ZHIYING_API_KEY` 并在容器内部注入请求头；密钥不会打包进前端 JavaScript。
+
 启动后访问 `http://localhost:5173`。Compose 会同时启动前端、后端、Redis 和 ChromaDB。
 
 ## API 示例

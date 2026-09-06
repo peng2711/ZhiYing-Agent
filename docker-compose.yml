@@ -58,6 +58,10 @@ services:
   frontend:
     build:
       context: ./frontend
+    # 本地 Docker 演示由同源 Nginx/BFF 注入 API Key，避免把密钥编译进浏览器 JS。
+    # 生产环境应为代理单独配置最小权限凭据。
+    env_file:
+      - ./backend/.env
     ports:
       - "5173:80"
     depends_on:
