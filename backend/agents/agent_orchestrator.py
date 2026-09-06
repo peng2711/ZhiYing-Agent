@@ -37,9 +37,10 @@ from agents.tools import (
     general_tools,
     technical_tools,
 )
-from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
+from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel, intent_group_for
 from core.llm_utils import extract_text_content
 from core.llm_client import LLMClient, create_llm_client
+from core.task_intent import TaskIntentTracker
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,7 @@ class Request:
     intent_group: Optional[str] = None
     urgency:     Optional[UrgencyLevel]   = None
     intent_confidence: float = 1.0
+    task_state: Dict[str, Any] = field(default_factory=dict)
     request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
 
 
@@ -159,6 +161,7 @@ class OrchestratorResult:
     citations: List[Dict[str, Any]] = field(default_factory=list)
     pending_action: Optional[Dict[str, Any]] = None
     ticket: Optional[Dict[str, Any]] = None
+    task_state: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -491,6 +494,7 @@ class BaseAgent:
             "urgency": req.urgency.name if req.urgency else None,
             "intent_confidence": round(req.intent_confidence, 4),
             "available_entities": req.entities or {},
+            "task_state": req.task_state or {},
         }
         return json.dumps(packet, ensure_ascii=False)
 
@@ -779,6 +783,7 @@ class AgentOrchestrator:
         client = create_llm_client(api_key=api_key, base_url=base_url)
 
         self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
+        self._task_intent_tracker = TaskIntentTracker()
         self._skill_manager = skill_manager
         self._composer = ResponseComposer(client, model, skill_manager)
         self._shared_tools: Dict[str, AgentToolSpec] = {}
@@ -844,6 +849,11 @@ class AgentOrchestrator:
         """对外暴露意图识别，供 API 层先判断是否需要 RAG 等前置能力。"""
         return await self._intent_recognizer.recognize(message, history=history)
 
+    def update_task_intent_state(
+        self, previous: Optional[Dict[str, Any]], intent: IntentCategory, message: str,
+    ) -> Dict[str, Any]:
+        return self._task_intent_tracker.update(previous, intent, message)
+
     def _record_tool_trace(self, result: OrchestratorResult) -> None:
         trace = {
             "request_id": result.request_id,
@@ -859,6 +869,7 @@ class AgentOrchestrator:
                 ("source_id", "document_name", "title", "version", "chunk")
                 if citation.get(key) is not None} for citation in result.citations],
             "pending_action": result.pending_action,
+            "task_state": result.task_state,
             "ticket_id": result.ticket.get("ticket_id") if result.ticket else None,
             "latency_ms": round(result.latency_ms, 1),
         }
@@ -892,6 +903,9 @@ class AgentOrchestrator:
             req.intent_group = intent_result.intent_group
             req.urgency = intent_result.urgency
             req.intent_confidence = intent_result.confidence
+            req.task_state = self.update_task_intent_state(req.task_state, req.intent, req.message)
+            req.intent = IntentCategory(req.task_state["active_intent"])
+            req.intent_group = intent_group_for(req.intent)
 
         if self._business_workflow is not None:
             workflow_outcome = await self._business_workflow.handle(req)
@@ -904,7 +918,7 @@ class AgentOrchestrator:
                     tools_attempted=list(workflow_outcome.tools_used), tools_used=list(workflow_outcome.tools_used),
                     tool_traces=list(workflow_outcome.tool_traces), routing_reason="命中持久化业务任务状态机",
                     routing_confidence=1.0, pending_action=workflow_outcome.pending_action,
-                    ticket=workflow_outcome.ticket,
+                    ticket=workflow_outcome.ticket, task_state=dict(req.task_state),
                 )
                 self._record_tool_trace(result)
                 return result
@@ -972,6 +986,7 @@ class AgentOrchestrator:
             citations=list(response.citations),
             pending_action=response.pending_action,
             ticket=response.ticket,
+            task_state=dict(req.task_state),
         )
         self._record_tool_trace(result)
         return result
@@ -1030,6 +1045,7 @@ class AgentOrchestrator:
             citations=citations,
             pending_action=next((item.pending_action for item in valid_responses if item.pending_action), None),
             ticket=next((item.ticket for item in valid_responses if item.ticket), None),
+            task_state=dict(req.task_state),
         )
         self._record_tool_trace(result)
         return result

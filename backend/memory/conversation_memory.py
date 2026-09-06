@@ -300,6 +300,29 @@ class MemoryManager:
     async def clear_task_state(self, user_id: str, conv_id: str) -> None:
         await self._redis.delete(self._task_key(user_id, conv_id))
 
+    async def get_intent_task_state(self, user_id: str, conv_id: str) -> Optional[Dict[str, Any]]:
+        raw = await self._redis.get(self._intent_task_key(user_id, conv_id))
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+            return value if isinstance(value, dict) else None
+        except (TypeError, json.JSONDecodeError):
+            logger.warning("忽略损坏的任务意图状态: %s/%s", user_id, conv_id)
+            return None
+
+    async def set_intent_task_state(
+        self, user_id: str, conv_id: str, state: Dict[str, Any], ttl_s: int = 3600,
+    ) -> None:
+        safe_state = json.loads(json.dumps(state, ensure_ascii=False, default=str))
+        await self._redis.setex(
+            self._intent_task_key(user_id, conv_id), max(60, min(int(ttl_s), 86400)),
+            json.dumps(safe_state, ensure_ascii=False),
+        )
+
+    async def clear_intent_task_state(self, user_id: str, conv_id: str) -> None:
+        await self._redis.delete(self._intent_task_key(user_id, conv_id))
+
     # ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
 
     async def _compress(self, user_id: str, conv_id: str, persist_long_term: bool = True) -> None:
@@ -437,6 +460,10 @@ class MemoryManager:
     @staticmethod
     def _task_key(user_id: str, conv_id: str) -> str:
         return f"task:{user_id}:{conv_id}"
+
+    @staticmethod
+    def _intent_task_key(user_id: str, conv_id: str) -> str:
+        return f"intent_task:{user_id}:{conv_id}"
 
     @staticmethod
     def _summary_key(user_id: str, conv_id: str) -> str:

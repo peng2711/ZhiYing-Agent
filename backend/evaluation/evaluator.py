@@ -20,6 +20,7 @@ import os
 import pathlib
 import statistics
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -27,7 +28,7 @@ from typing import Any, Dict, List, Optional
 from core.llm_utils import extract_text_content
 from core.llm_client import LLMClient, create_llm_client
 
-from core.intent_recognizer import IntentCategory, IntentRecognizer
+from core.intent_recognizer import IntentCategory, IntentRecognizer, intent_group_for
 from evaluation.business_evaluator import BusinessWorkflowEvaluator
 
 logger = logging.getLogger(__name__)
@@ -277,7 +278,7 @@ class EndToEndEvaluator:
         results: List[EvalResult] = []
         all_scores: Dict[str, List[float]] = {
             "relevance": [], "accuracy": [], "completeness": [], "helpfulness": [],
-            "dialog_intent_match": [],
+            "dialog_intent_match": [], "primary_task_retention": [],
         }
 
         # 1. 意图识别评测
@@ -364,28 +365,58 @@ class EndToEndEvaluator:
         if not questions:
             return []
 
-        conv_id = str(case.get("conv_id") or f"eval_{case_idx}")
+        # 每次评测使用独立会话，避免 Redis 中上一次运行的任务状态污染结果。
+        conv_id = str(case.get("conv_id") or f"eval_{case_idx}_{uuid.uuid4().hex[:8]}")
         user_id = str(case.get("user_id") or "eval_user")
         expected_intent = str(case.get("expected_intent") or "").strip()
+        expected_by_turn = case.get("expected_intents_by_turn") or []
+        expected_primary = {
+            str(value)
+            for value in (case.get("primary_intents") or [])
+            if str(value)
+        }
         history: List[Dict[str, str]] = []
         results: List[EvalResult] = []
+        task_state: Dict[str, Any] = {}
 
         for turn_idx, question in enumerate(questions):
             context = self._history_context(history)
+            intent_result = await self._orchestrator.recognize_intent(question, history=history)
+            task_state = self._orchestrator.update_task_intent_state(
+                task_state, intent_result.intent, question,
+            )
+            effective_intent = IntentCategory(task_state["active_intent"])
             orch_req = OrcReq(
                 message=question,
                 user_id=user_id,
                 conv_id=conv_id,
                 context=context,
                 history=history[-6:] if history else None,
+                entities=intent_result.entities,
+                intent=effective_intent,
+                intent_group=intent_group_for(effective_intent),
+                urgency=intent_result.urgency,
+                intent_confidence=intent_result.confidence,
+                task_state=task_state,
             )
             orch_result = await self._orchestrator.run(orch_req)
             actual_answer = orch_result.response
 
             scores = await self._judge.judge(question, actual_answer, context=context or None)
             actual_intent = orch_result.intent.value if orch_result.intent else ""
+            turn_expected = expected_by_turn[turn_idx] if turn_idx < len(expected_by_turn) else expected_intent
+            accepted_intents = {
+                str(value)
+                for value in (turn_expected if isinstance(turn_expected, list) else [turn_expected])
+                if str(value)
+            }
             intent_match = (
-                1.0 if not expected_intent else float(actual_intent == expected_intent)
+                1.0 if not accepted_intents else float(actual_intent in accepted_intents)
+            )
+            is_final_turn = turn_idx == len(questions) - 1
+            retained = set(task_state.get("primary_intents", []))
+            primary_task_retention = (
+                float(expected_primary <= retained) if is_final_turn and expected_primary else 1.0
             )
             # 对数据集提供了 expected_intent 的用例，把路由正确性纳入端到端
             # 通过条件。只看最终文本会掩盖“答得像但路由错了”的 Agent 回归。
@@ -393,6 +424,7 @@ class EndToEndEvaluator:
                 not scores.judge_failed
                 and scores.overall >= self.PASS_THRESHOLD
                 and intent_match >= 1.0
+                and primary_task_retention >= 1.0
             )
 
             history.append({"role": "user", "content": question})
@@ -408,7 +440,8 @@ class EndToEndEvaluator:
                     "completeness": scores.completeness,
                     "helpfulness": scores.helpfulness,
                     "overall": scores.overall,
-                    "intent_match": intent_match,
+                    "dialog_intent_match": intent_match,
+                    **({"primary_task_retention": primary_task_retention} if is_final_turn else {}),
                 },
                 detail=f"Q: {question[:30]}... → 综合评分 {scores.overall:.3f}",
                 metadata={
@@ -416,8 +449,10 @@ class EndToEndEvaluator:
                     "response": actual_answer,
                     "agent_type": orch_result.agent_type.value,
                     "intent": orch_result.intent.value if orch_result.intent else None,
-                    "expected_intent": expected_intent or None,
+                    "expected_intents": sorted(accepted_intents),
                     "intent_match": bool(intent_match),
+                    "task_state": dict(task_state),
+                    "primary_task_retention": bool(primary_task_retention),
                     "turn": turn_idx,
                     "conv_id": conv_id,
                     "judge_failed": scores.judge_failed,
@@ -481,6 +516,8 @@ class EndToEndEvaluator:
             recs.append("意图识别准确率 < 90%：增加 Few-shot 示例，或对低 F1 的意图类别补充训练数据")
         if scores.get("dialog_intent_match", 1.0) < 0.90:
             recs.append("对话路由命中率 < 90%：检查多轮上下文、细粒度意图边界和低置信度澄清策略")
+        if scores.get("primary_task_retention", 1.0) < 1.0:
+            recs.append("主任务保留率未达 100%：检查多目标提取和会话任务状态持久化")
         if scores.get("relevance", 1.0) < 0.80:
             recs.append("相关性偏低：检查 Agent system_prompt，确保 Agent 聚焦于用户问题")
         if scores.get("completeness", 1.0) < 0.80:

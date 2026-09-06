@@ -45,18 +45,34 @@
     "expected_intent": "account"
   },
   {
+    "id": "account_compound_01",
+    "question": "我想注销账户，但账户里还有一笔未完成订单，可以直接注销吗？",
+    "expected_intent": "account",
+    "expected_intents_by_turn": [["account", "order_status"]],
+    "primary_intents": ["account", "order_status"]
+  },
+  {
     "id": "handoff_01",
     "question": "这个问题比较紧急，请直接转人工客服。",
     "expected_intent": "human_handoff"
   },
   {
+    "id": "mixed_compound_01",
+    "question": "登录一直报 401，而且刚刚又被重复扣款，请先帮我排查登录再处理扣款。",
+    "expected_intent": "technical_login",
+    "expected_intents_by_turn": [["technical_login", "payment_issue"]],
+    "primary_intents": ["technical_login", "payment_issue"]
+  },
+  {
     "id": "refund_02",
     "turns": [
       "你好，我想申请退款",
-      "订单号是 #A12345，商品还没有发货",
-      "请问审核通过后多久到账？"
+      "订单号是 #A12345，商品还没有发货，可以继续办理吗？",
+      "如果审核通过，退款大概多久到账？"
     ],
-    "expected_intent": "refund"
+    "expected_intent": "refund",
+    "expected_intents_by_turn": ["refund", "refund", "refund"],
+    "primary_intents": ["refund"]
   },
   {
     "id": "invoice_02",
@@ -65,16 +81,20 @@
       "订单号是 #B20260830",
       "抬头是北京知应科技有限公司，税号需要填在哪里？"
     ],
-    "expected_intent": "invoice"
+    "expected_intent": "invoice",
+    "expected_intents_by_turn": ["invoice", "invoice", "invoice"],
+    "primary_intents": ["invoice"]
   },
   {
     "id": "logistics_03",
     "turns": [
       "我的订单什么时候到？",
-      "订单号是 #C10086",
+      "订单号是 10086",
       "页面显示已发货，但两天没有物流信息"
     ],
-    "expected_intent": "logistics"
+    "expected_intent": "logistics",
+    "expected_intents_by_turn": ["logistics", "logistics", "logistics"],
+    "primary_intents": ["logistics"]
   },
   {
     "id": "payment_02",
@@ -83,7 +103,9 @@
       "两笔扣款都是 99 元，时间相差一分钟",
       "请告诉我接下来需要提供哪些凭证"
     ],
-    "expected_intent": "payment_issue"
+    "expected_intent": "payment_issue",
+    "expected_intents_by_turn": ["payment_issue", "payment_issue", "payment_issue"],
+    "primary_intents": ["payment_issue"]
   },
   {
     "id": "login_02",
@@ -92,7 +114,9 @@
       "验证码一直收不到",
       "我已经确认手机号没有更换"
     ],
-    "expected_intent": "technical_login"
+    "expected_intent": "technical_login",
+    "expected_intents_by_turn": ["technical_login", "technical_login", "technical_login"],
+    "primary_intents": ["technical_login"]
   },
   {
     "id": "crash_02",
@@ -101,16 +125,20 @@
       "主要发生在提交订单时",
       "错误提示是 500，其他页面暂时正常"
     ],
-    "expected_intent": "technical_crash"
+    "expected_intent": "technical_crash",
+    "expected_intents_by_turn": ["technical_crash", "technical_crash", "technical_crash"],
+    "primary_intents": ["technical_crash"]
   },
   {
     "id": "account_02",
     "turns": [
       "我想注销账户",
-      "账户里还有一笔未完成订单",
-      "请问应该先处理订单还是可以直接注销？"
+      "账户里还有一笔未完成订单，这种情况还能注销吗？",
+      "那我应该先处理订单，还是可以直接继续注销？"
     ],
-    "expected_intent": "account"
+    "expected_intent": "account",
+    "expected_intents_by_turn": ["account", "account", "account"],
+    "primary_intents": ["account", "order_status"]
   },
   {
     "id": "handoff_02",
@@ -119,7 +147,9 @@
       "我已经等待了两天还没有处理",
       "请帮我整理信息并转给人工主管"
     ],
-    "expected_intent": "human_handoff"
+    "expected_intent": "human_handoff",
+    "expected_intents_by_turn": ["complaint", "complaint", "human_handoff"],
+    "primary_intents": ["complaint", "human_handoff"]
   },
   {
     "id": "mixed_01",
@@ -128,7 +158,9 @@
       "登录问题可以先告诉我排查步骤",
       "扣款问题也请说明需要核验哪些信息"
     ],
-    "expected_intent": "technical_login"
+    "expected_intent": "technical_login",
+    "expected_intents_by_turn": [["technical_login", "payment_issue"], "technical_login", "payment_issue"],
+    "primary_intents": ["technical_login", "payment_issue"]
   },
   {
     "id": "mixed_02",
@@ -137,6 +169,8 @@
       "订单已经支付但还没有发货",
       "请分别告诉我退款和开票的处理条件"
     ],
-    "expected_intent": "refund"
+    "expected_intent": "refund",
+    "expected_intents_by_turn": [["refund", "invoice"], "order_status", ["refund", "invoice"]],
+    "primary_intents": ["refund", "invoice", "order_status"]
   }
 ]

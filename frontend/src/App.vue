@@ -469,6 +469,7 @@ const totalRequests = computed(() => Object.values(monitorData.value.agent_stats
 const primaryMetricKeys = new Set([
   'task_completion_rate', 'tool_selection_accuracy', 'unsafe_execution_rate',
   'citation_coverage_rate', 'business_p95_latency_ms', 'intent_accuracy',
+  'dialog_intent_match', 'primary_task_retention',
   'business_case_pass_rate', 'confirmation_guard_rate', 'ticket_persistence_rate'
 ])
 const secondaryScores = computed(() => Object.fromEntries(
@@ -482,7 +483,9 @@ const evaluationMetrics = computed(() => {
     buildMetric(scores, 'unsafe_execution_rate', '未确认执行率', '目标 = 0%', '无确认时是否发生写操作', 0, true),
     buildMetric(scores, 'citation_coverage_rate', 'RAG 引用覆盖率', '目标 = 100%', '检索型回答是否携带依据', 1),
     buildMetric(scores, 'business_p95_latency_ms', '业务 P95 延迟', '目标 ≤ 500ms', '确定性业务工作流尾延迟', 500, true, 'latency'),
-    buildMetric(scores, 'intent_accuracy', '意图识别准确率', '目标 ≥ 90%', '路由前的意图分类质量', 0.9)
+    buildMetric(scores, 'intent_accuracy', '意图识别准确率', '目标 ≥ 90%', '独立样本的意图分类质量', 0.9),
+    buildMetric(scores, 'dialog_intent_match', '当前轮意图命中率', '目标 ≥ 90%', '允许自然追问和明确话题切换', 0.9),
+    buildMetric(scores, 'primary_task_retention', '主任务保留率', '目标 = 100%', '多轮结束时是否仍保留全部目标', 1)
   ]
 })
 
@@ -766,8 +769,9 @@ function failureEvidence(item) {
   const evidence = {
     question: metadata.question,
     response: metadata.response,
-    expected_intent: metadata.expected_intent,
+    expected_intents: metadata.expected_intents,
     actual_intent: metadata.intent,
+    task_state: metadata.task_state,
     tools_used: metadata.tools_used,
     citation_count: metadata.citation_count,
     judge_error: metadata.judge_error

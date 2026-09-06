@@ -150,6 +150,7 @@ function normalizeChatResponse(type, raw) {
     citations: raw.citations || [],
     pendingAction: raw.pending_action || raw.pendingAction || null,
     ticket: raw.ticket || null,
+    taskState: raw.task_state || raw.taskState || {},
     verified: raw.verified,
     grounded: raw.grounded,
     raw

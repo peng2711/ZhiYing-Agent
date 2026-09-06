@@ -14,7 +14,7 @@ import re
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 
 _ROOT = str(pathlib.Path(__file__).parent.parent.resolve())
@@ -27,6 +27,8 @@ from fastapi import FastAPI, HTTPException, Query, Request as FastAPIRequest, Re
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
+
+from core.intent_recognizer import IntentCategory, intent_group_for
 
 load_dotenv()
 
@@ -363,6 +365,7 @@ class ChatResponse(BaseModel):
     citations: List[Dict[str, Any]] = Field(default_factory=list)
     pending_action: Optional[Dict[str, Any]] = None
     ticket: Optional[Dict[str, Any]] = None
+    task_state: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolTraceResponse(BaseModel):
@@ -445,6 +448,13 @@ async def chat(req: ChatRequest, response: Response, request: FastAPIRequest):
     ] if mem_ctx.recent_messages else None
 
     intent_result = await _orchestrator.recognize_intent(req.message, history=history)
+    previous_task_state = await _memory.get_intent_task_state(memory_user_id, conv_id)
+    task_state = _orchestrator.update_task_intent_state(
+        previous_task_state, intent_result.intent, req.message,
+    )
+    await _memory.set_intent_task_state(memory_user_id, conv_id, task_state)
+    effective_intent = IntentCategory(task_state["active_intent"])
+    effective_intent_group = intent_group_for(effective_intent)
     # 当前版本采用 Agent Tool Use：RAG 由 Agent 按策略调用，不在 API 层重复预取。
     full_context = mem_ctx.to_prompt_text()
 
@@ -455,10 +465,11 @@ async def chat(req: ChatRequest, response: Response, request: FastAPIRequest):
         context=full_context,
         history=history,
         entities=intent_result.entities,
-        intent=intent_result.intent,
-        intent_group=intent_result.intent_group,
+        intent=effective_intent,
+        intent_group=effective_intent_group,
         urgency=intent_result.urgency,
         intent_confidence=intent_result.confidence,
+        task_state=task_state,
     )
 
     # 3. 执行
@@ -483,7 +494,7 @@ async def chat(req: ChatRequest, response: Response, request: FastAPIRequest):
         request_id=result.request_id,
         response=result.response,
         intent=result.intent.value if result.intent else "other",
-        intent_group=intent_result.intent_group,
+        intent_group=effective_intent_group,
         agent_type=result.agent_type.value,
         agent_types=[agent_type.value for agent_type in result.agent_types],
         primary_agent=result.primary_agent.value if result.primary_agent else result.agent_type.value,
@@ -501,6 +512,7 @@ async def chat(req: ChatRequest, response: Response, request: FastAPIRequest):
         citations=result.citations,
         pending_action=result.pending_action,
         ticket=result.ticket,
+        task_state=result.task_state,
     )
 
 
@@ -554,6 +566,7 @@ async def reset_demo(request: FastAPIRequest, body: Optional[DemoResetRequest] =
     user_id, _, _ = _resolve_chat_identity(request, "anonymous")
     if body and body.conv_id:
         await _memory.clear_task_state(user_id, body.conv_id)
+        await _memory.clear_intent_task_state(user_id, body.conv_id)
     return {"message": "演示业务数据已恢复", **_business_backend.reset_demo_data()}
 
 
@@ -613,6 +626,9 @@ class EvalDialogInput(BaseModel):
     turns: Optional[List[str]] = Field(default=None, max_length=50)
     user_id: Optional[str] = Field(default=None, max_length=128)
     conv_id: Optional[str] = Field(default=None, max_length=128)
+    expected_intent: Optional[str] = Field(default=None, max_length=64)
+    expected_intents_by_turn: Optional[List[Union[str, List[str]]]] = Field(default=None, max_length=50)
+    primary_intents: Optional[List[str]] = Field(default=None, max_length=20)
 
 
 class EvalRunInput(BaseModel):

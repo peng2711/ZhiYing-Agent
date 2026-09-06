@@ -132,6 +132,11 @@ _INTENT_GROUPS: Dict[IntentCategory, IntentCategory] = {
     IntentCategory.HUMAN_HANDOFF: IntentCategory.ESCALATION,
 }
 
+
+def intent_group_for(intent: IntentCategory) -> str:
+    """返回细粒度意图对应的稳定业务分组。"""
+    return _INTENT_GROUPS.get(intent, intent).value
+
 # 紧急关键词
 _URGENCY_KEYWORDS = {
     UrgencyLevel.CRITICAL: ["紧急", "emergency", "urgent", "asap", "立刻"],
@@ -514,7 +519,7 @@ class IntentRecognizer:
 
     @staticmethod
     def _intent_group(intent: IntentCategory) -> str:
-        return _INTENT_GROUPS.get(intent, intent).value
+        return intent_group_for(intent)
 
     @staticmethod
     def _clean_text(value: Any) -> str:

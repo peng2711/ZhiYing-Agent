@@ -29,6 +29,10 @@ def test_public_dialog_dataset_contains_single_and_multi_turn_cases():
     assert all(case.get("question") or case.get("turns") for case in DEFAULT_DIALOG_CASES)
     # 对话用例带有期望意图，评测器会将其用于路由轨迹校验。
     assert all(case.get("expected_intent") for case in DEFAULT_DIALOG_CASES)
+    multi_turn = [case for case in DEFAULT_DIALOG_CASES if case.get("turns")]
+    assert all(len(case.get("expected_intents_by_turn", [])) == len(case["turns"]) for case in multi_turn)
+    assert all(case.get("primary_intents") for case in multi_turn)
+    assert any("但" in case.get("question", "") and case.get("primary_intents") for case in DEFAULT_DIALOG_CASES)
 
 
 def test_latest_report_can_be_explicitly_promoted_to_atomic_baseline(tmp_path):
