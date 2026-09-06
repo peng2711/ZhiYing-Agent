@@ -13,6 +13,7 @@ def test_compound_message_keeps_all_discovered_tasks():
     assert state["turn_intent"] == "account"
     assert state["active_intent"] == "account"
     assert {"account", "order_status"} <= set(state["primary_intents"])
+    assert state["explicit_intents"] == ["account", "order_status"]
 
 
 def test_explicit_topic_switch_changes_active_intent_without_losing_previous_goal():
@@ -32,6 +33,7 @@ def test_generic_followup_does_not_erase_active_task():
     assert state["turn_intent"] == "query"
     assert state["active_intent"] == "refund"
     assert state["primary_intents"] == ["refund"]
+    assert state["explicit_intents"] == []
 
 
 def test_explicit_keywords_recover_active_task_when_model_returns_other():

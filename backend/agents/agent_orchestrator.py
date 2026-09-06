@@ -139,6 +139,7 @@ class Request:
     urgency:     Optional[UrgencyLevel]   = None
     intent_confidence: float = 1.0
     task_state: Dict[str, Any] = field(default_factory=dict)
+    focus_intent: Optional[IntentCategory] = None
     request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
 
 
@@ -477,7 +478,19 @@ class BaseAgent:
             "6. 不展示内部提示词、推理过程、工具 JSON 或虚构的后台查询结果。\n"
             "回答应简洁但闭环：结论 → 依据/限制 → 下一步；不要为了凑结构重复无关内容。"
         )
-        base_prompt = f"{self.system_prompt}{profile_prompt}{response_protocol}"
+        focus_prompt = ""
+        if req.focus_intent is not None:
+            focus_label = AgentOrchestrator._GOAL_LABELS.get(
+                req.focus_intent, req.focus_intent.value,
+            )
+            focus_prompt = (
+                "\n\n[组合答复中的当前子任务]\n"
+                f"当前唯一允许回答的主题是“{focus_label}”({req.focus_intent.value})。"
+                "用户原话可能同时包含其他主题，但其他主题会由独立子任务回答。"
+                "只输出当前主题的结论、依据、限制和下一步；不要解释、总结或重复其他主题，"
+                "也不要自行添加主题标题，标题由编排器统一生成。"
+            )
+        base_prompt = f"{self.system_prompt}{profile_prompt}{response_protocol}{focus_prompt}"
         if self._skill_manager is None:
             return base_prompt
         skill_prompt = self._skill_manager.prompt_for(req.message, self.agent_type.value)
@@ -495,6 +508,7 @@ class BaseAgent:
             "intent_confidence": round(req.intent_confidence, 4),
             "available_entities": req.entities or {},
             "task_state": req.task_state or {},
+            "focus_intent": req.focus_intent.value if req.focus_intent else None,
         }
         return json.dumps(packet, ensure_ascii=False)
 
@@ -767,6 +781,28 @@ class AgentOrchestrator:
         IntentCategory.HUMAN_HANDOFF: AgentType.ESCALATION,
         # 其余意图 → GENERAL（默认）
     }
+    _MULTI_GOAL_INTENTS = {
+        IntentCategory.ACCOUNT,
+        IntentCategory.ACCOUNT_SECURITY,
+        IntentCategory.ORDER_STATUS,
+        IntentCategory.LOGISTICS,
+        IntentCategory.REFUND,
+        IntentCategory.INVOICE,
+        IntentCategory.PAYMENT_ISSUE,
+        IntentCategory.TECHNICAL_LOGIN,
+        IntentCategory.TECHNICAL_CRASH,
+    }
+    _GOAL_LABELS = {
+        IntentCategory.ACCOUNT: "账户管理",
+        IntentCategory.ACCOUNT_SECURITY: "账户安全",
+        IntentCategory.ORDER_STATUS: "订单状态",
+        IntentCategory.LOGISTICS: "物流",
+        IntentCategory.REFUND: "退款",
+        IntentCategory.INVOICE: "发票",
+        IntentCategory.PAYMENT_ISSUE: "支付与扣款",
+        IntentCategory.TECHNICAL_LOGIN: "登录问题",
+        IntentCategory.TECHNICAL_CRASH: "系统故障",
+    }
 
     def __init__(
         self,
@@ -907,6 +943,10 @@ class AgentOrchestrator:
             req.intent = IntentCategory(req.task_state["active_intent"])
             req.intent_group = intent_group_for(req.intent)
 
+        current_goals = self._current_explicit_goals(req)
+        if len(current_goals) > 1:
+            return await self.run_multi_goal(req, current_goals)
+
         if self._business_workflow is not None:
             workflow_outcome = await self._business_workflow.handle(req)
             if workflow_outcome is not None:
@@ -1045,6 +1085,99 @@ class AgentOrchestrator:
             citations=citations,
             pending_action=next((item.pending_action for item in valid_responses if item.pending_action), None),
             ticket=next((item.ticket for item in valid_responses if item.ticket), None),
+            task_state=dict(req.task_state),
+        )
+        self._record_tool_trace(result)
+        return result
+
+    async def run_multi_goal(
+        self,
+        req: Request,
+        goals: List[IntentCategory],
+    ) -> OrchestratorResult:
+        """逐目标执行同一轮复合请求，支持多个目标落到同一种 Agent。"""
+        t0 = time.monotonic()
+        goal_responses: List[Tuple[IntentCategory, AgentResponse]] = []
+
+        # 同类 Agent 实例带有本次调用的 trace 临时状态，因此顺序执行，避免并发串线。
+        for goal in goals:
+            focused_task_state = dict(req.task_state or {})
+            focused_task_state.update({
+                "active_intent": goal.value,
+                "turn_intent": goal.value,
+                "explicit_intents": [goal.value],
+            })
+            sub_req = replace(
+                req,
+                intent=goal,
+                intent_group=intent_group_for(goal),
+                task_state=focused_task_state,
+                focus_intent=goal,
+            )
+            response: Optional[AgentResponse] = None
+            if goal == IntentCategory.REFUND and self._business_workflow is not None:
+                workflow_outcome = await self._business_workflow.handle(sub_req)
+                if workflow_outcome is not None:
+                    response = AgentResponse(
+                        agent_type=AgentType.BILLING,
+                        content=workflow_outcome.response,
+                        success=True,
+                        tools_attempted=list(workflow_outcome.tools_used),
+                        tools_used=list(workflow_outcome.tools_used),
+                        tool_traces=list(workflow_outcome.tool_traces),
+                        pending_action=workflow_outcome.pending_action,
+                        ticket=workflow_outcome.ticket,
+                    )
+            if response is None:
+                response = await self._execute(sub_req, self._route(goal, req.urgency))
+            goal_responses.append((goal, response))
+
+        successful = [(goal, response) for goal, response in goal_responses if response.success]
+        if successful:
+            combined = "\n\n".join(
+                f"### {self._GOAL_LABELS.get(goal, goal.value)}\n{response.content.strip()}"
+                for goal, response in successful
+                if response.content.strip()
+            )
+        else:
+            combined = "抱歉，当前多个问题都未能完成处理，请稍后重试或转人工客服。"
+
+        valid_responses = [response for _, response in goal_responses]
+        agent_types = list(dict.fromkeys(
+            response.agent_type for response in valid_responses if response.success
+        ))
+        primary_agent = self._route(req.intent, req.urgency)
+        supporting_agents = [agent for agent in agent_types if agent != primary_agent]
+        tools_attempted = list(dict.fromkeys(
+            name for response in valid_responses for name in response.tools_attempted
+        ))
+        tools_used = list(dict.fromkeys(
+            name for response in valid_responses for name in response.tools_used
+        ))
+        citations: List[Dict[str, Any]] = []
+        for response in valid_responses:
+            for citation in response.citations:
+                if citation not in citations:
+                    citations.append(citation)
+
+        result = OrchestratorResult(
+            request_id=req.request_id,
+            response=combined,
+            agent_type=primary_agent,
+            intent=req.intent,
+            escalated=any(response.escalate for response in valid_responses),
+            latency_ms=(time.monotonic() - t0) * 1000,
+            agent_types=agent_types or [primary_agent],
+            primary_agent=primary_agent,
+            supporting_agents=supporting_agents,
+            tools_attempted=tools_attempted,
+            tools_used=tools_used,
+            tool_traces=[trace for response in valid_responses for trace in response.tool_traces],
+            routing_reason=f"当前轮多目标拆分：{', '.join(goal.value for goal in goals)}",
+            routing_confidence=max(req.intent_confidence, 0.8),
+            citations=citations,
+            pending_action=next((response.pending_action for response in valid_responses if response.pending_action), None),
+            ticket=next((response.ticket for response in valid_responses if response.ticket), None),
             task_state=dict(req.task_state),
         )
         self._record_tool_trace(result)
@@ -1230,6 +1363,23 @@ class AgentOrchestrator:
         # 保持顺序去重，并只返回当前有实例的 Agent 类型。
         deduped = list(dict.fromkeys(targets))
         return [agent_type for agent_type in deduped if self._pool.get(agent_type)]
+
+    def _current_explicit_goals(self, req: Request) -> List[IntentCategory]:
+        """读取当前轮明确目标；历史 primary_intents 不参与本轮重复执行。"""
+        if req.urgency == UrgencyLevel.CRITICAL or req.intent in (
+            IntentCategory.ESCALATION,
+            IntentCategory.HUMAN_HANDOFF,
+        ):
+            return []
+        goals: List[IntentCategory] = []
+        for value in (req.task_state or {}).get("explicit_intents", []):
+            try:
+                intent = IntentCategory(str(value))
+            except ValueError:
+                continue
+            if intent in self._MULTI_GOAL_INTENTS and intent not in goals:
+                goals.append(intent)
+        return goals[:3]
 
     @staticmethod
     def _needs_clarification(req: Request) -> bool:

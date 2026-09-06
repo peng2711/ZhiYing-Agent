@@ -74,16 +74,21 @@ class TaskIntentTracker:
             "primary_intents": primary,
             "active_intent": active,
             "turn_intent": current_intent.value,
+            # 只描述本轮文本明确出现的目标；历史任务保存在 primary_intents。
+            # 编排器仅对这里的多个目标做拆分，避免每轮重复执行全部历史任务。
+            "explicit_intents": [intent.value for intent in explicit_discovered],
             "turn": int(previous.get("turn", 0) or 0) + 1,
         }
 
     @staticmethod
     def detect_intents(message: str) -> List[IntentCategory]:
         lowered = str(message or "").lower()
-        return [
-            intent for intent, hints in _INTENT_HINTS.items()
-            if any(hint in lowered for hint in hints)
-        ]
+        matches = []
+        for order, (intent, hints) in enumerate(_INTENT_HINTS.items()):
+            positions = [lowered.find(hint) for hint in hints if hint in lowered]
+            if positions:
+                matches.append((min(positions), order, intent))
+        return [intent for _, _, intent in sorted(matches)]
 
     @staticmethod
     def _valid_intents(values: Iterable[Any]) -> List[str]:

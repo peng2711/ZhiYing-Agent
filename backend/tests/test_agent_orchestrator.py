@@ -3,6 +3,7 @@ import asyncio
 from agents.agent_orchestrator import (
     AgentProfile,
     AgentResponse,
+    AgentOrchestrator,
     AgentType,
     BillingAgent,
     EscalationAgent,
@@ -250,3 +251,59 @@ def test_rag_results_are_exposed_as_structured_citations():
     assert response.citations[0]["source_id"] == "refund-policy"
     assert response.citations[0]["version"] == "3.0"
     assert response.citations[0]["chunk"] == 2
+
+
+def test_same_domain_multi_goal_executes_each_goal_and_keeps_sections():
+    orchestrator = AgentOrchestrator.__new__(AgentOrchestrator)
+    orchestrator._business_workflow = None
+    calls = []
+
+    async def execute(req, agent_type):
+        calls.append((
+            req.focus_intent,
+            req.intent,
+            agent_type,
+            req.task_state["explicit_intents"],
+        ))
+        return AgentResponse(
+            agent_type=AgentType.BILLING,
+            content=f"已处理 {req.focus_intent.value}",
+            success=True,
+        )
+
+    orchestrator._execute = execute
+    orchestrator._route = lambda intent, urgency: AgentType.BILLING
+    orchestrator._record_tool_trace = lambda result: None
+    req = make_request(
+        message="我想退款并申请发票",
+        intent=IntentCategory.REFUND,
+        intent_group="billing",
+        task_state={"explicit_intents": ["refund", "invoice"]},
+    )
+
+    result = asyncio.run(orchestrator.run_multi_goal(
+        req,
+        [IntentCategory.REFUND, IntentCategory.INVOICE],
+    ))
+
+    assert "### 退款" in result.response
+    assert "### 发票" in result.response
+    assert [call[0] for call in calls] == [IntentCategory.REFUND, IntentCategory.INVOICE]
+    assert all(call[1] == call[0] for call in calls)
+    assert [call[3] for call in calls] == [["refund"], ["invoice"]]
+    assert result.task_state["explicit_intents"] == ["refund", "invoice"]
+    assert result.routing_reason == "当前轮多目标拆分：refund, invoice"
+
+
+def test_focused_prompt_forbids_answering_other_goals():
+    agent = BillingAgent(client=FakeClient(), model="test")
+    req = make_request(
+        message="我想退款并申请发票",
+        intent=IntentCategory.INVOICE,
+        focus_intent=IntentCategory.INVOICE,
+    )
+
+    prompt = agent._build_system_prompt(req)
+
+    assert "当前唯一允许回答的主题是“发票”" in prompt
+    assert "不要解释、总结或重复其他主题" in prompt

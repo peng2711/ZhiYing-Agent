@@ -41,6 +41,8 @@ sequenceDiagram
 
 Agent 只能调用其白名单中的工具。对于退款、发票、支付和技术故障等事实型意图，首轮会强制调用 `search_knowledge_base`，防止模型在没有业务依据时直接生成政策结论。
 
+编排器同时区分“Agent 类型”和“业务目标”。`TaskIntentTracker` 将当前轮明确出现的目标写入 `explicit_intents`；当一轮包含多个目标时，编排器按目标创建隔离的子任务状态并逐项执行。这样“退款 + 发票”即使都由 `BillingAgent` 处理，也不会因为按 Agent 类型去重或退款状态机提前返回而遗漏其中一项。历史目标只保存在 `primary_intents` 中，不会在后续每一轮被重复执行。
+
 ## 意图识别
 
 `IntentRecognizer` 并行执行三类策略：
