@@ -1,4 +1,5 @@
 from core.intent_recognizer import IntentCategory
+from core.intent_recognizer import IntentRecognizer
 from core.task_intent import TaskIntentTracker
 
 
@@ -41,3 +42,23 @@ def test_explicit_keywords_recover_active_task_when_model_returns_other():
     assert state["turn_intent"] == "other"
     assert state["active_intent"] == "refund"
     assert {"refund", "invoice", "order_status"} <= set(state["primary_intents"])
+
+
+def test_account_deletion_is_not_misclassified_as_account_security():
+    scores = {}
+    intent = IntentRecognizer._enforce_business_boundary(
+        "我想注销当前账户",
+        IntentCategory.ACCOUNT_SECURITY,
+        scores,
+    )
+    assert intent == IntentCategory.ACCOUNT
+    assert scores["business_boundary_override"] == 1.0
+
+
+def test_stolen_account_remains_account_security():
+    intent = IntentRecognizer._enforce_business_boundary(
+        "账户被盗，我想注销账户并重置密码",
+        IntentCategory.ACCOUNT_SECURITY,
+        {},
+    )
+    assert intent == IntentCategory.ACCOUNT_SECURITY

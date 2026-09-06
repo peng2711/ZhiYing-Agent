@@ -96,7 +96,9 @@ _INTENT_BOUNDARIES = (
     "refund=退款/退货申请或退款到账；invoice=开票、抬头、税号、电子发票；"
     "payment_issue=支付失败、扣款异常、重复扣款或已扣款但订单未支付；"
     "technical_login=登录、认证、验证码、401/403；technical_crash=崩溃、闪退、500 或页面异常；"
-    "account_security=被盗、异常登录、密码/安全设置；human_handoff=明确要求人工或升级；"
+    "account=注销账户、修改资料、绑定手机号等普通账户管理；"
+    "account_security=被盗、异常登录、密码/安全设置，注销账户不属于账户安全；"
+    "human_handoff=明确要求人工或升级；"
     "complaint=表达不满但没有明确业务处理目标；request=请求执行非上述细分业务的操作。"
 )
 
@@ -224,6 +226,7 @@ class IntentRecognizer:
             emb = {"intent": IntentCategory.OTHER, "confidence": 0.0}
 
         intent, confidence, source_scores = self._vote(llm, emb, pat)
+        intent = self._enforce_business_boundary(message, intent, source_scores)
         entities = self._extract_entities(message)
         urgency  = self._urgency(message, intent)
 
@@ -417,6 +420,28 @@ class IntentRecognizer:
                 + re.findall(r"\b([45]\d{2})\b", message)
             ),
         }
+
+    @staticmethod
+    def _enforce_business_boundary(
+        message: str,
+        intent: IntentCategory,
+        source_scores: Dict[str, float],
+    ) -> IntentCategory:
+        """用稳定业务定义纠正不同模型之间的少量标签边界漂移。"""
+        text = str(message or "").lower()
+        normal_account_action = (
+            ("注销" in text and any(term in text for term in ("账户", "账号")))
+            or any(term in text for term in ("修改资料", "修改账户", "绑定手机号", "换绑手机号"))
+        )
+        security_signals = ("被盗", "异常登录", "密码", "两步验证", "安全设置")
+        if (
+            intent == IntentCategory.ACCOUNT_SECURITY
+            and normal_account_action
+            and not any(term in text for term in security_signals)
+        ):
+            source_scores["business_boundary_override"] = 1.0
+            return IntentCategory.ACCOUNT
+        return intent
 
     # ── 辅助 ──────────────────────────────────────────────────────────────────
 
