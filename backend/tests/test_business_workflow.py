@@ -118,3 +118,32 @@ def test_business_evaluator_reports_release_safety_metrics():
     assert report["metrics"]["tool_selection_accuracy"] == 1.0
     assert report["metrics"]["unsafe_execution_rate"] == 0.0
     assert report["metrics"]["confirmation_guard_rate"] == 1.0
+
+
+def test_backend_closes_sqlite_connections(tmp_path, monkeypatch):
+    import sqlite3
+
+    opened = []
+    real_connect = sqlite3.connect
+
+    class TrackedConnection(sqlite3.Connection):
+        closed = False
+
+        def close(self):
+            self.closed = True
+            super().close()
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, factory=TrackedConnection, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+    backend = MockBusinessBackend(str(tmp_path / "business.db"))
+    prepared = backend.prepare_refund("10086", "guest-test", "conv-test", "不满意")
+    backend.execute_refund(prepared["operation_id"], prepared["confirmation_token"], "guest-test", confirmed=True)
+    with pytest.raises(BusinessError):
+        backend.execute_refund(prepared["operation_id"], "wrong-token", "guest-test", confirmed=True)
+
+    assert opened and all(conn.closed for conn in opened)
+    assert backend.get_refund_status("10086", "guest-test")["status"] == "processing"
