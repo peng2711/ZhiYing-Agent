@@ -3,17 +3,19 @@
 
 核心问题：多 Agent 情况下如何做 Routing？
 
-路由策略（三层决策）：
-  1. 意图路由 —— 根据 IntentCategory 直接映射到专属 Agent
-  2. 性能路由 —— 同类 Agent 有多个时，选成功率最高、延迟最低的
-  3. 降级路由 —— 专属 Agent 不可用时，自动降级到 GeneralAgent
+路由策略：
+  1. 意图路由 —— 根据意图、关键词和实体为各领域 Agent 打分，选出主 Agent 和辅助 Agent
+  2. 降级路由 —— 专属 Agent 失败时，自动降级到 GeneralAgent
+  （Agent 池预留了同类多实例按 routing_score 选择的扩展点，但当前每类只有一个实例，
+   且 routing_score 只反映是否抛异常和延迟，不反映回答质量，不能作为多模型选择依据。）
 
 并行协作：
   - 复杂问题（如"技术问题 + 账单问题"）可同时派发给多个 Agent
   - 结果由 Orchestrator 合并后返回
 
 升级机制：
-  - Agent 置信度低于阈值 → 自动升级到更高级 Agent 或转人工
+  - 用户要求转人工或紧急度为 CRITICAL → 直接路由到 EscalationAgent
+  - 专业 Agent 调用 request_human_handoff → 追加 EscalationAgent 创建工单
 """
 import asyncio
 import inspect
@@ -762,10 +764,9 @@ class AgentOrchestrator:
     """
     多 Agent 编排器。
 
-    路由逻辑（三层）：
-      1. 意图 → Agent 类型映射
-      2. 同类多实例时按 routing_score() 选最优
-      3. 专属 Agent 失败时降级到 GeneralAgent
+    路由逻辑：
+      1. 意图、关键词和实体 → 领域打分，决定主 Agent 与辅助 Agent
+      2. 专属 Agent 失败时降级到 GeneralAgent
     """
 
     # 意图 → Agent 类型的静态映射（路由表）
@@ -828,7 +829,7 @@ class AgentOrchestrator:
         self._recent_tool_traces = deque(maxlen=_env_int("ZHIYING_TOOL_TRACE_MAX", 200))
         self._business_workflow = business_workflow
 
-        # Agent 池：每种类型可有多个实例（水平扩展）
+        # Agent 池：当前每种类型一个实例；列表结构为同类多实例预留。
         self._pool: Dict[AgentType, List[BaseAgent]] = {
             AgentType.GENERAL: [self._make_agent(GeneralAgent, client, model, skill_manager)],
             AgentType.TECHNICAL: [self._make_agent(TechnicalAgent, client, model, skill_manager)],
@@ -1362,8 +1363,8 @@ class AgentOrchestrator:
 
     def _best_agent(self, agent_type: AgentType) -> Optional[BaseAgent]:
         """
-        性能路由：从同类 Agent 中选 routing_score() 最高的。
-        这是"基于在线表现动态调整路由"的核心。
+        从同类 Agent 中选 routing_score() 最高的实例。
+        当前每类只有一个实例，这里实际直接返回该实例。
         """
         agents = self._pool.get(agent_type, [])
         if not agents:
