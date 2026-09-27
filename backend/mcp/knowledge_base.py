@@ -62,8 +62,15 @@ class KnowledgeBase:
         # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
         self._collection = self._client.get_or_create_collection(
             name=self.COLLECTION_NAME,
-            metadata={"description": "ZhiYing Agent RAG 知识库"},
+            metadata={"description": "ZhiYing Agent RAG 知识库", "hnsw:space": "cosine"},
         )
+        # 已存在的 collection 不会因为传入 hnsw:space 而改变索引，按实际距离类型换算分数。
+        self._distance_space = (self._collection.metadata or {}).get("hnsw:space", "l2")
+        if self._distance_space != "cosine":
+            logger.warning(
+                "知识库 collection 使用 %s 距离（旧版本创建），检索分数将换算为余弦相似度；"
+                "重建 collection 后可直接使用 cosine 距离", self._distance_space,
+            )
         self._migrate_legacy_metadata()
 
         # 如果知识库为空，导入默认文档
@@ -189,7 +196,7 @@ class KnowledgeBase:
                     "effective_from": effective_from,
                     "effective_to": effective_to,
                     "content":  doc,
-                    "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
+                    "score":    round(self._similarity(dist), 4),
                     "chunk":    meta.get("chunk_index", 0),
                 })
 
@@ -356,6 +363,16 @@ class KnowledgeBase:
         if ids_to_update:
             self._collection.update(ids=ids_to_update, metadatas=metas_to_update)
             logger.info("已迁移 %s 个历史知识片段的版本元数据", len(ids_to_update))
+
+    def _similarity(self, distance: float) -> float:
+        """把 ChromaDB 距离换算为余弦相似度。
+
+        cosine / ip 距离为 1 - cos（ip 需向量已归一化）；l2 是平方欧氏距离，
+        对 ChromaDB 默认 embedding 输出的归一化向量有 d = 2 - 2cos。
+        """
+        if self._distance_space == "l2":
+            return 1.0 - distance / 2
+        return 1.0 - distance
 
     def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
         """将长文本按 chunk_size 切片，保留语义完整性（按句号/换行切分）。"""
