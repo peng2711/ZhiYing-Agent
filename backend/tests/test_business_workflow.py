@@ -51,6 +51,24 @@ def test_multiturn_task_collects_order_then_executes(tmp_path):
     assert backend.get_refund_status("10086", "guest-test")["status"] == "processing"
 
 
+@pytest.mark.parametrize("reply", ["是的", "是", "好", "确认", "yes", "OK"])
+def test_generic_affirmation_does_not_execute_refund(tmp_path, reply):
+    backend, store = MockBusinessBackend(str(tmp_path / "business.db")), FakeTaskStore()
+    workflow = BusinessWorkflow(backend, store)
+    asyncio.run(workflow.handle(request("我要退款", entities={"order_id": ["10086"]})))
+
+    outcome = asyncio.run(workflow.handle(request(reply, IntentCategory.OTHER)))
+
+    assert "execute_refund" not in outcome.tools_used
+    assert "确认退款" in outcome.response
+    assert outcome.pending_action["step"] == "pending_confirmation"
+    assert "confirmation_token" not in outcome.pending_action
+    assert backend.get_order("10086", "guest-test")["status"] == "in_transit"
+    # 待确认状态保留，用户随后明确确认仍可执行。
+    completed = asyncio.run(workflow.handle(request("确认退款", IntentCategory.OTHER)))
+    assert completed.tools_used == ["execute_refund"]
+
+
 def test_refund_policy_question_is_not_treated_as_refund_action(tmp_path):
     backend, store = MockBusinessBackend(str(tmp_path / "business.db")), FakeTaskStore()
     workflow = BusinessWorkflow(backend, store)

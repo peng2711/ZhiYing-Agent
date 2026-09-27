@@ -18,7 +18,9 @@ class WorkflowOutcome:
 
 
 class BusinessWorkflow:
-    CONFIRM_RE = re.compile(r"^\s*(确认|确定|同意|是的|是|yes|confirm|立即退款|确认退款)[。！!\s]*$", re.I)
+    # 资金操作只接受明确点名“退款”的确认；“是的/好/确认”可能是在回答别的问题。
+    CONFIRM_RE = re.compile(r"^\s*(确认退款|立即退款|confirm refund)[。！!\s]*$", re.I)
+    GENERIC_AFFIRM_RE = re.compile(r"^\s*(确认|确定|同意|是的|是|好的|好|可以|嗯|yes|ok|confirm)[。！!\s]*$", re.I)
     CANCEL_RE = re.compile(r"^\s*(取消|不用了|不确认|否|no|cancel)[。！!\s]*$", re.I)
     BARE_ORDER_RE = re.compile(r"^\s*#?([A-Za-z0-9_-]{4,32})\s*$")
     REFUND_INFORMATION_MARKERS = (
@@ -56,6 +58,12 @@ class BusinessWorkflow:
                 await self.task_store.clear_task_state(req.user_id, req.conv_id)
                 return WorkflowOutcome("已取消本次退款操作，订单状态没有改变。", ["cancel_pending_operation"],
                                        [self._trace("cancel_pending_operation", {"operation_id": task["operation_id"]})])
+            if self.GENERIC_AFFIRM_RE.fullmatch(message):
+                public_action = {key: value for key, value in task.items() if key != "confirmation_token"}
+                return WorkflowOutcome(
+                    f"{task.get('summary', '当前有一笔待确认的退款。')}\n\n"
+                    "为避免误操作，请回复“确认退款”执行，或回复“取消”放弃本次退款。",
+                    pending_action=public_action)
         if task and task.get("step") == "waiting_order_id":
             match = self.BARE_ORDER_RE.fullmatch(message)
             if match:
