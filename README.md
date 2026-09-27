@@ -192,6 +192,8 @@ Docker 前端通过同源 Nginx 代理访问后端，代理从 `backend/.env` �
 
 启动后访问 `http://localhost:5173`。Compose 会同时启动前端、后端、Redis 和 ChromaDB。
 
+所有端口默认只绑定 `127.0.0.1`。前端代理会为所有 `/api/python/*` 请求注入 API Key，包括知识库写入、Skills 重载和评测接口；需要对外访问时，请在前面加一层带用户鉴权的反向代理，不要直接把端口改成对外监听。
+
 ## API 示例
 
 ```bash
