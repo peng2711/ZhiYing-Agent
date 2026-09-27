@@ -307,3 +307,74 @@ def test_focused_prompt_forbids_answering_other_goals():
 
     assert "当前唯一允许回答的主题是“发票”" in prompt
     assert "不要解释、总结或重复其他主题" in prompt
+
+
+def test_concurrent_requests_do_not_share_pending_action():
+    """同一 Agent 实例被并发请求共享时，退款确认单只能出现在发起者自己的响应里。"""
+    from agents.tools import make_tool
+
+    class ToolUseBlock:
+        type, id, name = "tool_use", "toolu_refund", "prepare_refund"
+        input = {"order_id": "10086", "reason": "不想要了"}
+
+    class TextBlock:
+        type = "text"
+
+        def __init__(self, text):
+            self.text = text
+
+    a_prepared = asyncio.Event()
+    others_done = asyncio.Event()
+
+    class InterleavingClient:
+        class Messages:
+            async def create(self, **kwargs):
+                messages = kwargs["messages"]
+                if "A 申请退款" in str(messages):
+                    if isinstance(messages[-1]["content"], str):
+                        return type("Response", (), {"content": [ToolUseBlock()]})()
+                    # A 已执行 prepare_refund，等其他请求结束后才返回最终回复。
+                    await others_done.wait()
+                    return type("Response", (), {"content": [TextBlock("A 的退款确认单已生成")]})()
+                if "B 咨询" in str(messages):
+                    # B 在 A 调用工具之前进入，在 A 结束之前返回。
+                    await a_prepared.wait()
+                return type("Response", (), {"content": [TextBlock("已回复")]})()
+
+        messages = Messages()
+
+    def prepare_refund(req, args):
+        a_prepared.set()
+        return {"success": True, "order_id": args["order_id"], "owner": req.user_id,
+                "confirmation_token": "secret"}
+
+    agent = BillingAgent(InterleavingClient(), "test-model")
+    agent.set_domain_tools({"prepare_refund": make_tool(
+        "prepare_refund", "生成退款确认单",
+        {"order_id": {"type": "string"}, "reason": {"type": "string"}},
+        prepare_refund, ["order_id", "reason"],
+    )})
+
+    def billing_request(message, user_id):
+        return make_request(message=message, user_id=user_id, conv_id=user_id,
+                            intent=IntentCategory.BILLING, entities={})
+
+    async def scenario():
+        task_b = asyncio.create_task(agent.handle(billing_request("B 咨询发票", "user_b")))
+        await asyncio.sleep(0)
+        task_a = asyncio.create_task(agent.handle(billing_request("A 申请退款 10086", "user_a")))
+        response_b = await task_b
+        # C 在 A 工具调用之后、A 返回之前开始并结束。
+        response_c = await agent.handle(billing_request("C 咨询发票", "user_c"))
+        others_done.set()
+        return await task_a, response_b, response_c
+
+    response_a, response_b, response_c = asyncio.run(scenario())
+
+    assert response_a.pending_action is not None
+    assert response_a.pending_action["owner"] == "user_a"
+    assert "confirmation_token" not in response_a.pending_action
+    assert response_a.tools_used == ["prepare_refund"]
+    assert response_b.pending_action is None
+    assert response_b.tools_attempted == []
+    assert response_c.pending_action is None

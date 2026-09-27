@@ -127,6 +127,21 @@ class AgentResponse:
 
 
 @dataclass
+class _AgentRun:
+    """单次 Agent 调用的临时状态。
+
+    同一 Agent 实例会被并发请求共享，这些字段不能挂在实例上，
+    否则一个用户的退款确认单等结果可能出现在另一个用户的响应里。
+    """
+    tools_attempted: List[str] = field(default_factory=list)
+    tools_used: List[str] = field(default_factory=list)
+    tool_traces: List[Dict[str, Any]] = field(default_factory=list)
+    citations: List[Dict[str, Any]] = field(default_factory=list)
+    pending_action: Optional[Dict[str, Any]] = None
+    ticket: Optional[Dict[str, Any]] = None
+
+
+@dataclass
 class Request:
     message:     str
     user_id:     str
@@ -203,14 +218,8 @@ class BaseAgent:
         self._model  = self.profile.model or model
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
-        self._last_tools_attempted: List[str] = []
-        self._last_tools_used: List[str] = []
-        self._last_tool_traces: List[Dict[str, Any]] = []
         self._shared_tools: Dict[str, AgentToolSpec] = {}
         self._domain_tools: Dict[str, AgentToolSpec] = {}
-        self._last_citations: List[Dict[str, Any]] = []
-        self._last_pending_action: Optional[Dict[str, Any]] = None
-        self._last_ticket: Optional[Dict[str, Any]] = None
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         """返回该角色真实可调用的工具白名单。"""
@@ -225,14 +234,9 @@ class BaseAgent:
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
-        self._last_tools_attempted = []
-        self._last_tools_used = []
-        self._last_tool_traces = []
-        self._last_citations = []
-        self._last_pending_action = None
-        self._last_ticket = None
+        run = _AgentRun()
         try:
-            content = await self._call_llm(req)
+            content = await self._call_llm(req, run)
             ms = (time.monotonic() - t0) * 1000
             self.stats.success += 1
             self.stats.total_ms += ms
@@ -243,12 +247,12 @@ class BaseAgent:
                 success=True,
                 latency_ms=ms,
                 escalate=escalate,
-                tools_attempted=list(self._last_tools_attempted),
-                tools_used=list(self._last_tools_used),
-                tool_traces=list(self._last_tool_traces),
-                citations=list(self._last_citations),
-                pending_action=self._last_pending_action,
-                ticket=self._last_ticket,
+                tools_attempted=list(run.tools_attempted),
+                tools_used=list(run.tools_used),
+                tool_traces=list(run.tool_traces),
+                citations=list(run.citations),
+                pending_action=run.pending_action,
+                ticket=run.ticket,
             )
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
@@ -259,11 +263,11 @@ class BaseAgent:
                 content="抱歉，处理您的请求时出现问题，请稍后重试。",
                 success=False,
                 latency_ms=ms,
-                tools_attempted=list(self._last_tools_attempted),
-                tool_traces=list(self._last_tool_traces),
+                tools_attempted=list(run.tools_attempted),
+                tool_traces=list(run.tool_traces),
             )
 
-    async def _call_llm(self, req: Request) -> str:
+    async def _call_llm(self, req: Request, run: _AgentRun) -> str:
         def _clean(s: str) -> str:
             return s.encode("utf-8", errors="ignore").decode("utf-8")
 
@@ -301,10 +305,10 @@ class BaseAgent:
             "search_knowledge_base" in tools
             and (intent_requires_rag or message_requires_rag)
         )
-        tools_used: List[str] = []
-        tools_attempted: List[str] = []
-        tool_traces: List[Dict[str, Any]] = []
-        citations: List[Dict[str, Any]] = []
+        tools_used = run.tools_used
+        tools_attempted = run.tools_attempted
+        tool_traces = run.tool_traces
+        citations = run.citations
         for round_idx in range(max_rounds):
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
@@ -337,10 +341,6 @@ class BaseAgent:
                 if rag_required and round_idx == 0:
                     # 事实类意图不能在首轮绕过知识库，否则模型可能凭常识编造政策。
                     raise RuntimeError("事实类意图未调用 search_knowledge_base")
-                self._last_tools_attempted = tools_attempted
-                self._last_tools_used = tools_used
-                self._last_tool_traces = tool_traces
-                self._last_citations = citations
                 return extract_text_content(resp.content)
 
             messages.append({"role": "assistant", "content": resp.content})
@@ -382,11 +382,11 @@ class BaseAgent:
                                     if citation and citation not in citations:
                                         citations.append(citation)
                             elif name == "prepare_refund" and isinstance(result, dict):
-                                self._last_pending_action = {"type": "refund", "step": "pending_confirmation",
+                                run.pending_action = {"type": "refund", "step": "pending_confirmation",
                                     **{key: value for key, value in result.items()
                                        if key not in {"success", "confirmation_token"}}}
                             elif name == "create_ticket" and isinstance(result, dict):
-                                self._last_ticket = result.get("ticket")
+                                run.ticket = result.get("ticket")
                     except Exception as ex:
                         call_success = False
                         logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
@@ -416,10 +416,6 @@ class BaseAgent:
                 })
             messages.append({"role": "user", "content": tool_results})
 
-        self._last_tools_attempted = tools_attempted
-        self._last_tools_used = tools_used
-        self._last_tool_traces = tool_traces
-        self._last_citations = citations
         raise RuntimeError(f"{self.agent_type.value} 工具调用超过最大轮数")
 
     @staticmethod
@@ -1099,7 +1095,7 @@ class AgentOrchestrator:
         t0 = time.monotonic()
         goal_responses: List[Tuple[IntentCategory, AgentResponse]] = []
 
-        # 同类 Agent 实例带有本次调用的 trace 临时状态，因此顺序执行，避免并发串线。
+        # 逐目标顺序执行：子任务可能读写同一会话的业务任务状态，并发执行会互相覆盖。
         for goal in goals:
             focused_task_state = dict(req.task_state or {})
             focused_task_state.update({
