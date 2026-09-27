@@ -53,6 +53,7 @@ class FakeCollection:
 def make_kb():
     kb = KnowledgeBase.__new__(KnowledgeBase)
     kb._collection = FakeCollection()
+    kb._distance_space = "cosine"
     return kb
 
 
@@ -111,3 +112,29 @@ def test_delete_version_only_removes_exact_version():
         }])
     assert kb.delete_version("refund-policy", "1.0") == 1
     assert {item["version"] for item in kb.list_versions("refund-policy")} == {"2.0"}
+
+
+def _open_kb(path, monkeypatch):
+    # 端口 1 无服务，走本地持久化模式；跳过默认文档导入以免下载 embedding 模型。
+    monkeypatch.setattr(KnowledgeBase, "_load_default_docs", lambda self: None)
+    return KnowledgeBase(chroma_host="127.0.0.1", chroma_port=1, chroma_path=str(path))
+
+
+def test_new_collection_uses_cosine_distance(tmp_path, monkeypatch):
+    kb = _open_kb(tmp_path, monkeypatch)
+
+    assert kb._distance_space == "cosine"
+    assert kb._similarity(0.25) == 0.75
+
+
+def test_legacy_l2_collection_scores_are_converted_to_cosine(tmp_path, monkeypatch):
+    import chromadb
+
+    legacy = chromadb.PersistentClient(path=str(tmp_path), settings=chromadb.Settings(anonymized_telemetry=False))
+    legacy.get_or_create_collection(KnowledgeBase.COLLECTION_NAME, metadata={"description": "旧版本"})
+
+    kb = _open_kb(tmp_path, monkeypatch)
+
+    assert kb._distance_space == "l2"
+    # 归一化向量的平方欧氏距离 d = 2 - 2cos：cos=0.9 时 d=0.2。
+    assert abs(kb._similarity(0.2) - 0.9) < 1e-9

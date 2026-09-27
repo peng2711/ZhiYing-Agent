@@ -41,6 +41,8 @@ sequenceDiagram
 
 Agent 只能调用其白名单中的工具。对于退款、发票、支付和技术故障等事实型意图，首轮会强制调用 `search_knowledge_base`，防止模型在没有业务依据时直接生成政策结论。
 
+专业 Agent 判断需要人工介入时调用 `request_human_handoff`，编排器据此转交 `EscalationAgent` 创建工单；回复文字里提到“人工客服”不会触发升级。用户明确要求转人工或紧急度为 CRITICAL 时，由意图路由直接进入 `EscalationAgent`。
+
 编排器同时区分“Agent 类型”和“业务目标”。`TaskIntentTracker` 将当前轮明确出现的目标写入 `explicit_intents`；当一轮包含多个目标时，编排器按目标创建隔离的子任务状态并逐项执行。这样“退款 + 发票”即使都由 `BillingAgent` 处理，也不会因为按 Agent 类型去重或退款状态机提前返回而遗漏其中一项。历史目标只保存在 `primary_intents` 中，不会在后续每一轮被重复执行。
 
 ## 意图识别
@@ -55,14 +57,14 @@ Agent 只能调用其白名单中的工具。对于退款、发票、支付和�
 
 ## LLM 适配
 
-项目内部保留 Anthropic Messages 风格的工具循环，由 `core/llm_client.py` 负责转换为 DeepSeek 原生 OpenAI-compatible 请求：
+项目内部保留 Anthropic Messages 风格的工具循环。`LLM_PROVIDER` 选择客户端：`qwen_openai`（默认配置，阿里云百炼）、`deepseek`、`openai` 走 OpenAI-compatible 接口，由 `core/llm_client.py` 负责转换；未设置时直接使用 Anthropic SDK。转换内容包括：
 
 - 消息与 system prompt 转换
 - Tool schema 和 `tool_choice` 转换
 - Tool call 结果回传
 - 响应内容转换回内部统一结构
 
-DeepSeek Thinking Mode 默认关闭，因为当前链路会对事实型意图强制指定工具。若启用 Thinking Mode，需要同时实现 `reasoning_content` 的完整回传。
+Qwen（`QWEN_THINKING`）和 DeepSeek（`DEEPSEEK_THINKING`）的思考模式默认关闭，因为当前链路会对事实型意图强制指定工具。若启用思考模式，需要同时实现 `reasoning_content` 的完整回传。
 
 ## 记忆与知识库
 
@@ -75,7 +77,7 @@ DeepSeek Thinking Mode 默认关闭，因为当前链路会对事实型意图强
 
 ## 可观测与评测
 
-仓库提供一套可直接运行的公开评测集：120 条意图分类样本和 20 组单轮/多轮对话样本，分别位于 `backend/evaluation/datasets/intent_cases.json` 与 `dialog_cases.json`。新增样本只需按现有 JSON 字段追加，不需要修改评测代码。
+仓库提供一套可直接运行的公开评测集：120 条意图分类样本和 22 组单轮/多轮对话样本，分别位于 `backend/evaluation/datasets/intent_cases.json` 与 `dialog_cases.json`。新增样本只需按现有 JSON 字段追加，不需要修改评测代码。
 
 每次请求生成 `request_id`，Trace 记录：
 

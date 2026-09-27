@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -163,6 +164,8 @@ class IntentRecognizer:
     模板 Embedding 在首次请求时懒加载并缓存，后续复用。
     """
 
+    CACHE_MAX_SIZE = 1000
+
     def __init__(
         self,
         api_key: str,
@@ -182,7 +185,7 @@ class IntentRecognizer:
 
         self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
         self._embedding_lock = asyncio.Lock()
-        self._cache: Dict[str, IntentResult] = {}
+        self._cache: "OrderedDict[str, IntentResult]" = OrderedDict()
         self.cache_hits   = 0
         self.cache_misses = 0
 
@@ -209,6 +212,7 @@ class IntentRecognizer:
         key = self._cache_key(message, history)
         if key in self._cache:
             self.cache_hits += 1
+            self._cache.move_to_end(key)
             return self._cache[key]
         self.cache_misses += 1
 
@@ -241,11 +245,11 @@ class IntentRecognizer:
             source_scores=source_scores,
         )
 
-        # LRU 缓存
-        if len(self._cache) >= 1000:
-            for k in list(self._cache)[:500]:
-                del self._cache[k]
+        # LRU 缓存：命中时移到末尾，超出容量时淘汰最久未使用的一条。
         self._cache[key] = result
+        self._cache.move_to_end(key)
+        while len(self._cache) > self.CACHE_MAX_SIZE:
+            self._cache.popitem(last=False)
         return result
 
     def learn(self, message: str, correct: IntentCategory) -> None:

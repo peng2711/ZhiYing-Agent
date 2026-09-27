@@ -51,6 +51,24 @@ def test_multiturn_task_collects_order_then_executes(tmp_path):
     assert backend.get_refund_status("10086", "guest-test")["status"] == "processing"
 
 
+@pytest.mark.parametrize("reply", ["是的", "是", "好", "确认", "yes", "OK"])
+def test_generic_affirmation_does_not_execute_refund(tmp_path, reply):
+    backend, store = MockBusinessBackend(str(tmp_path / "business.db")), FakeTaskStore()
+    workflow = BusinessWorkflow(backend, store)
+    asyncio.run(workflow.handle(request("我要退款", entities={"order_id": ["10086"]})))
+
+    outcome = asyncio.run(workflow.handle(request(reply, IntentCategory.OTHER)))
+
+    assert "execute_refund" not in outcome.tools_used
+    assert "确认退款" in outcome.response
+    assert outcome.pending_action["step"] == "pending_confirmation"
+    assert "confirmation_token" not in outcome.pending_action
+    assert backend.get_order("10086", "guest-test")["status"] == "in_transit"
+    # 待确认状态保留，用户随后明确确认仍可执行。
+    completed = asyncio.run(workflow.handle(request("确认退款", IntentCategory.OTHER)))
+    assert completed.tools_used == ["execute_refund"]
+
+
 def test_refund_policy_question_is_not_treated_as_refund_action(tmp_path):
     backend, store = MockBusinessBackend(str(tmp_path / "business.db")), FakeTaskStore()
     workflow = BusinessWorkflow(backend, store)
@@ -100,3 +118,32 @@ def test_business_evaluator_reports_release_safety_metrics():
     assert report["metrics"]["tool_selection_accuracy"] == 1.0
     assert report["metrics"]["unsafe_execution_rate"] == 0.0
     assert report["metrics"]["confirmation_guard_rate"] == 1.0
+
+
+def test_backend_closes_sqlite_connections(tmp_path, monkeypatch):
+    import sqlite3
+
+    opened = []
+    real_connect = sqlite3.connect
+
+    class TrackedConnection(sqlite3.Connection):
+        closed = False
+
+        def close(self):
+            self.closed = True
+            super().close()
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, factory=TrackedConnection, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+    backend = MockBusinessBackend(str(tmp_path / "business.db"))
+    prepared = backend.prepare_refund("10086", "guest-test", "conv-test", "不满意")
+    backend.execute_refund(prepared["operation_id"], prepared["confirmation_token"], "guest-test", confirmed=True)
+    with pytest.raises(BusinessError):
+        backend.execute_refund(prepared["operation_id"], "wrong-token", "guest-test", confirmed=True)
+
+    assert opened and all(conn.closed for conn in opened)
+    assert backend.get_refund_status("10086", "guest-test")["status"] == "processing"

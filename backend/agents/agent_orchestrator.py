@@ -3,17 +3,19 @@
 
 核心问题：多 Agent 情况下如何做 Routing？
 
-路由策略（三层决策）：
-  1. 意图路由 —— 根据 IntentCategory 直接映射到专属 Agent
-  2. 性能路由 —— 同类 Agent 有多个时，选成功率最高、延迟最低的
-  3. 降级路由 —— 专属 Agent 不可用时，自动降级到 GeneralAgent
+路由策略：
+  1. 意图路由 —— 根据意图、关键词和实体为各领域 Agent 打分，选出主 Agent 和辅助 Agent
+  2. 降级路由 —— 专属 Agent 失败时，自动降级到 GeneralAgent
+  （Agent 池预留了同类多实例按 routing_score 选择的扩展点，但当前每类只有一个实例，
+   且 routing_score 只反映是否抛异常和延迟，不反映回答质量，不能作为多模型选择依据。）
 
 并行协作：
   - 复杂问题（如"技术问题 + 账单问题"）可同时派发给多个 Agent
   - 结果由 Orchestrator 合并后返回
 
 升级机制：
-  - Agent 置信度低于阈值 → 自动升级到更高级 Agent 或转人工
+  - 用户要求转人工或紧急度为 CRITICAL → 直接路由到 EscalationAgent
+  - 专业 Agent 调用 request_human_handoff → 追加 EscalationAgent 创建工单
 """
 import asyncio
 import inspect
@@ -35,6 +37,7 @@ from agents.tools import (
     billing_tools,
     escalation_tools,
     general_tools,
+    handoff_tools,
     technical_tools,
 )
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel, intent_group_for
@@ -127,6 +130,22 @@ class AgentResponse:
 
 
 @dataclass
+class _AgentRun:
+    """单次 Agent 调用的临时状态。
+
+    同一 Agent 实例会被并发请求共享，这些字段不能挂在实例上，
+    否则一个用户的退款确认单等结果可能出现在另一个用户的响应里。
+    """
+    tools_attempted: List[str] = field(default_factory=list)
+    tools_used: List[str] = field(default_factory=list)
+    tool_traces: List[Dict[str, Any]] = field(default_factory=list)
+    citations: List[Dict[str, Any]] = field(default_factory=list)
+    pending_action: Optional[Dict[str, Any]] = None
+    ticket: Optional[Dict[str, Any]] = None
+    escalate: bool = False
+
+
+@dataclass
 class Request:
     message:     str
     user_id:     str
@@ -203,14 +222,8 @@ class BaseAgent:
         self._model  = self.profile.model or model
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
-        self._last_tools_attempted: List[str] = []
-        self._last_tools_used: List[str] = []
-        self._last_tool_traces: List[Dict[str, Any]] = []
         self._shared_tools: Dict[str, AgentToolSpec] = {}
         self._domain_tools: Dict[str, AgentToolSpec] = {}
-        self._last_citations: List[Dict[str, Any]] = []
-        self._last_pending_action: Optional[Dict[str, Any]] = None
-        self._last_ticket: Optional[Dict[str, Any]] = None
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         """返回该角色真实可调用的工具白名单。"""
@@ -225,30 +238,24 @@ class BaseAgent:
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
-        self._last_tools_attempted = []
-        self._last_tools_used = []
-        self._last_tool_traces = []
-        self._last_citations = []
-        self._last_pending_action = None
-        self._last_ticket = None
+        run = _AgentRun()
         try:
-            content = await self._call_llm(req)
+            content = await self._call_llm(req, run)
             ms = (time.monotonic() - t0) * 1000
             self.stats.success += 1
             self.stats.total_ms += ms
-            escalate = self._needs_escalation(content)
             return AgentResponse(
                 agent_type=self.agent_type,
                 content=content,
                 success=True,
                 latency_ms=ms,
-                escalate=escalate,
-                tools_attempted=list(self._last_tools_attempted),
-                tools_used=list(self._last_tools_used),
-                tool_traces=list(self._last_tool_traces),
-                citations=list(self._last_citations),
-                pending_action=self._last_pending_action,
-                ticket=self._last_ticket,
+                escalate=run.escalate,
+                tools_attempted=list(run.tools_attempted),
+                tools_used=list(run.tools_used),
+                tool_traces=list(run.tool_traces),
+                citations=list(run.citations),
+                pending_action=run.pending_action,
+                ticket=run.ticket,
             )
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
@@ -259,11 +266,11 @@ class BaseAgent:
                 content="抱歉，处理您的请求时出现问题，请稍后重试。",
                 success=False,
                 latency_ms=ms,
-                tools_attempted=list(self._last_tools_attempted),
-                tool_traces=list(self._last_tool_traces),
+                tools_attempted=list(run.tools_attempted),
+                tool_traces=list(run.tool_traces),
             )
 
-    async def _call_llm(self, req: Request) -> str:
+    async def _call_llm(self, req: Request, run: _AgentRun) -> str:
         def _clean(s: str) -> str:
             return s.encode("utf-8", errors="ignore").decode("utf-8")
 
@@ -301,10 +308,10 @@ class BaseAgent:
             "search_knowledge_base" in tools
             and (intent_requires_rag or message_requires_rag)
         )
-        tools_used: List[str] = []
-        tools_attempted: List[str] = []
-        tool_traces: List[Dict[str, Any]] = []
-        citations: List[Dict[str, Any]] = []
+        tools_used = run.tools_used
+        tools_attempted = run.tools_attempted
+        tool_traces = run.tool_traces
+        citations = run.citations
         for round_idx in range(max_rounds):
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
@@ -337,10 +344,6 @@ class BaseAgent:
                 if rag_required and round_idx == 0:
                     # 事实类意图不能在首轮绕过知识库，否则模型可能凭常识编造政策。
                     raise RuntimeError("事实类意图未调用 search_knowledge_base")
-                self._last_tools_attempted = tools_attempted
-                self._last_tools_used = tools_used
-                self._last_tool_traces = tool_traces
-                self._last_citations = citations
                 return extract_text_content(resp.content)
 
             messages.append({"role": "assistant", "content": resp.content})
@@ -382,11 +385,13 @@ class BaseAgent:
                                     if citation and citation not in citations:
                                         citations.append(citation)
                             elif name == "prepare_refund" and isinstance(result, dict):
-                                self._last_pending_action = {"type": "refund", "step": "pending_confirmation",
+                                run.pending_action = {"type": "refund", "step": "pending_confirmation",
                                     **{key: value for key, value in result.items()
                                        if key not in {"success", "confirmation_token"}}}
                             elif name == "create_ticket" and isinstance(result, dict):
-                                self._last_ticket = result.get("ticket")
+                                run.ticket = result.get("ticket")
+                            elif name == "request_human_handoff":
+                                run.escalate = True
                     except Exception as ex:
                         call_success = False
                         logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
@@ -416,10 +421,6 @@ class BaseAgent:
                 })
             messages.append({"role": "user", "content": tool_results})
 
-        self._last_tools_attempted = tools_attempted
-        self._last_tools_used = tools_used
-        self._last_tool_traces = tool_traces
-        self._last_citations = citations
         raise RuntimeError(f"{self.agent_type.value} 工具调用超过最大轮数")
 
     @staticmethod
@@ -454,6 +455,10 @@ class BaseAgent:
 
     def _build_system_prompt(self, req: Request) -> str:
         """把角色契约和动态 Skills 拼入 system prompt。"""
+        handoff_hint = (
+            "满足升级条件时必须调用 request_human_handoff 工具，只在文字里写“转人工”不会触发升级。\n"
+            if "request_human_handoff" in self.get_tools() else ""
+        )
         profile_prompt = (
             f"\n\n[角色契约]\n"
             f"角色：{self.profile.role}\n"
@@ -463,6 +468,7 @@ class BaseAgent:
             f"输出要求：{'；'.join(self.profile.output_contract)}\n"
             f"升级条件：{'；'.join(self.profile.handoff_conditions) or '无，按通用客服规则处理'}\n"
             f"允许的数据/工具范围：{'、'.join(self.profile.tool_scope) or '仅使用当前请求上下文'}\n"
+            f"{handoff_hint}"
             "不要声称执行了未提供的查询、修改或退款操作；缺少证据时明确说明需要核验。"
         )
         # 统一的回答协议：让各专业 Agent 的输出可执行、可校验，减少
@@ -512,11 +518,6 @@ class BaseAgent:
         }
         return json.dumps(packet, ensure_ascii=False)
 
-    def _needs_escalation(self, content: str) -> bool:
-        """检测 Agent 是否建议升级（简单关键词检测）。"""
-        keywords = ["转人工", "人工客服", "escalate", "specialist", "无法处理"]
-        return any(kw in content for kw in keywords)
-
 
 class GeneralAgent(BaseAgent):
     agent_type    = AgentType.GENERAL
@@ -527,7 +528,7 @@ class GeneralAgent(BaseAgent):
         input_contract=("对话历史", "用户画像", "意图与紧急度", "知识库上下文"),
         output_contract=("先回应核心问题", "信息不足时只询问必要字段", "明确下一步和边界"),
         handoff_conditions=("涉及权限、资金、隐私或复杂投诉", "用户明确要求人工"),
-        tool_scope=("search_knowledge_base", "get_order", "get_logistics", "inspect_request_context", "suggest_required_fields"),
+        tool_scope=("search_knowledge_base", "get_order", "get_logistics", "inspect_request_context", "suggest_required_fields", "request_human_handoff"),
         temperature=0.3,
         max_tokens=900,
     )
@@ -545,6 +546,7 @@ class GeneralAgent(BaseAgent):
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         tools = super().get_tools()
         tools.update(general_tools())
+        tools.update(handoff_tools())
         return tools
 
 
@@ -557,7 +559,7 @@ class TechnicalAgent(BaseAgent):
         input_contract=("错误码", "问题发生时间", "运行环境", "影响范围", "最近变更", "知识库上下文"),
         output_contract=("现象复述", "可能原因", "编号排查步骤", "验证结果", "需要补充的信息"),
         handoff_conditions=("生产大面积不可用", "数据丢失或权限异常", "需要后台日志、数据库或人工操作"),
-        tool_scope=("search_knowledge_base", "lookup_error_code", "build_diagnostic_plan"),
+        tool_scope=("search_knowledge_base", "lookup_error_code", "build_diagnostic_plan", "request_human_handoff"),
         temperature=0.1,
         max_tokens=1200,
     )
@@ -578,6 +580,7 @@ class TechnicalAgent(BaseAgent):
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         tools = super().get_tools()
         tools.update(technical_tools())
+        tools.update(handoff_tools())
         return tools
 
 
@@ -590,7 +593,7 @@ class BillingAgent(BaseAgent):
         input_contract=("订单号", "金额与币种", "支付时间", "支付渠道", "用户期望", "知识库上下文"),
         output_contract=("需要核验的信息", "当前可判断内容", "下一步处理路径", "时效边界"),
         handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
-        tool_scope=("search_knowledge_base", "get_order", "check_refund_eligibility", "prepare_refund", "get_refund_status", "check_billing_fields", "compare_amounts"),
+        tool_scope=("search_knowledge_base", "get_order", "check_refund_eligibility", "prepare_refund", "get_refund_status", "check_billing_fields", "compare_amounts", "request_human_handoff"),
         temperature=0.0,
         max_tokens=1100,
     )
@@ -618,6 +621,7 @@ class BillingAgent(BaseAgent):
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         tools = super().get_tools()
         tools.update(billing_tools())
+        tools.update(handoff_tools())
         return tools
 
 
@@ -760,10 +764,9 @@ class AgentOrchestrator:
     """
     多 Agent 编排器。
 
-    路由逻辑（三层）：
-      1. 意图 → Agent 类型映射
-      2. 同类多实例时按 routing_score() 选最优
-      3. 专属 Agent 失败时降级到 GeneralAgent
+    路由逻辑：
+      1. 意图、关键词和实体 → 领域打分，决定主 Agent 与辅助 Agent
+      2. 专属 Agent 失败时降级到 GeneralAgent
     """
 
     # 意图 → Agent 类型的静态映射（路由表）
@@ -808,7 +811,7 @@ class AgentOrchestrator:
         self,
         api_key:  str,
         base_url: Optional[str] = None,
-        model:    str = "claude-3-5-sonnet-20241022",
+        model:    str = "qwen3.7-plus",
         skill_manager: Optional[Any] = None,
         rag_tool_manager: Optional[Any] = None,
         business_workflow: Optional[Any] = None,
@@ -826,7 +829,7 @@ class AgentOrchestrator:
         self._recent_tool_traces = deque(maxlen=_env_int("ZHIYING_TOOL_TRACE_MAX", 200))
         self._business_workflow = business_workflow
 
-        # Agent 池：每种类型可有多个实例（水平扩展）
+        # Agent 池：当前每种类型一个实例；列表结构为同类多实例预留。
         self._pool: Dict[AgentType, List[BaseAgent]] = {
             AgentType.GENERAL: [self._make_agent(GeneralAgent, client, model, skill_manager)],
             AgentType.TECHNICAL: [self._make_agent(TechnicalAgent, client, model, skill_manager)],
@@ -1099,7 +1102,7 @@ class AgentOrchestrator:
         t0 = time.monotonic()
         goal_responses: List[Tuple[IntentCategory, AgentResponse]] = []
 
-        # 同类 Agent 实例带有本次调用的 trace 临时状态，因此顺序执行，避免并发串线。
+        # 逐目标顺序执行：子任务可能读写同一会话的业务任务状态，并发执行会互相覆盖。
         for goal in goals:
             focused_task_state = dict(req.task_state or {})
             focused_task_state.update({
@@ -1331,39 +1334,6 @@ class AgentOrchestrator:
             f"primary={primary_agent.value}, supporting={support_text}, scores=[{score_text}]"
         )
 
-    def _collaboration_targets(self, req: Request) -> List[AgentType]:
-        """
-        判断是否需要多个 Agent 并行协作。
-
-        意图识别通常只返回一个主意图；这里用领域关键词补充检测复合问题，
-        例如"登录报错且被重复扣款"需要技术和账单 Agent 同时处理。
-        """
-        msg = req.message.lower()
-        targets: List[AgentType] = []
-
-        technical_kws = ["崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500", "401"]
-        billing_kws = ["退款", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice"]
-
-        if req.intent in (
-            IntentCategory.TECHNICAL,
-            IntentCategory.TECHNICAL_LOGIN,
-            IntentCategory.TECHNICAL_CRASH,
-        ) or any(kw in msg for kw in technical_kws):
-            targets.append(AgentType.TECHNICAL)
-        if req.intent in (
-            IntentCategory.BILLING,
-            IntentCategory.ACCOUNT,
-            IntentCategory.ACCOUNT_SECURITY,
-            IntentCategory.REFUND,
-            IntentCategory.INVOICE,
-            IntentCategory.PAYMENT_ISSUE,
-        ) or any(kw in msg for kw in billing_kws):
-            targets.append(AgentType.BILLING)
-
-        # 保持顺序去重，并只返回当前有实例的 Agent 类型。
-        deduped = list(dict.fromkeys(targets))
-        return [agent_type for agent_type in deduped if self._pool.get(agent_type)]
-
     def _current_explicit_goals(self, req: Request) -> List[IntentCategory]:
         """读取当前轮明确目标；历史 primary_intents 不参与本轮重复执行。"""
         if req.urgency == UrgencyLevel.CRITICAL or req.intent in (
@@ -1393,8 +1363,8 @@ class AgentOrchestrator:
 
     def _best_agent(self, agent_type: AgentType) -> Optional[BaseAgent]:
         """
-        性能路由：从同类 Agent 中选 routing_score() 最高的。
-        这是"基于在线表现动态调整路由"的核心。
+        从同类 Agent 中选 routing_score() 最高的实例。
+        当前每类只有一个实例，这里实际直接返回该实例。
         """
         agents = self._pool.get(agent_type, [])
         if not agents:

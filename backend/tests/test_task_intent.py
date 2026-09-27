@@ -73,3 +73,33 @@ def test_explicit_new_order_status_switch_wins_over_stale_model_intent():
     assert state["turn_intent"] == "refund"
     assert state["active_intent"] == "order_status"
     assert {"refund", "invoice", "order_status"} <= set(state["primary_intents"])
+
+
+def test_intent_cache_evicts_least_recently_used():
+    import asyncio
+
+    from core.intent_recognizer import IntentCategory
+
+    recognizer = IntentRecognizer(api_key="test", model="test-model")
+    recognizer._embedding_enabled = False
+    recognizer.CACHE_MAX_SIZE = 2
+    llm_calls = []
+
+    async def fake_llm(message, history=None):
+        llm_calls.append(message)
+        return {"intent": IntentCategory.QUERY, "confidence": 0.9, "reasoning": ""}
+
+    recognizer._llm_recognize = fake_llm
+
+    async def scenario():
+        await recognizer.recognize("消息A")
+        await recognizer.recognize("消息B")
+        await recognizer.recognize("消息A")  # 命中，A 变为最近使用
+        await recognizer.recognize("消息C")  # 超出容量，应淘汰最久未使用的 B
+        await recognizer.recognize("消息A")  # 仍应命中
+        await recognizer.recognize("消息B")  # 已被淘汰，重新调用 LLM
+
+    asyncio.run(scenario())
+
+    assert llm_calls == ["消息A", "消息B", "消息C", "消息B"]
+    assert recognizer.cache_hits == 2

@@ -55,6 +55,8 @@ _monitor      = None
 _evaluator    = None
 _skill_manager = None
 _business_backend = None
+# 完整评测会触发上百次 LLM 调用，同一进程内只允许一个评测运行，避免重复触发放大成本。
+_eval_lock = asyncio.Lock()
 
 def _llm_cfg() -> Dict[str, Any]:
     key = os.getenv("LLM_API_KEY", "")
@@ -811,6 +813,8 @@ async def run_eval(body: Optional[EvalRunInput] = None):
     """运行内置评测用例，返回评测报告。"""
     if _evaluator is None:
         raise HTTPException(503, "服务未就绪")
+    if _eval_lock.locked():
+        raise HTTPException(409, "已有评测正在运行，请等待完成后再试")
     from evaluation.evaluator import DEFAULT_DIALOG_CASES, DEFAULT_INTENT_CASES, IntentTestCase
 
     if body and body.intent_cases is not None:
@@ -833,10 +837,11 @@ async def run_eval(body: Optional[EvalRunInput] = None):
     else:
         dialog_cases = DEFAULT_DIALOG_CASES
 
-    report = await _evaluator.run(
-        intent_cases=intent_cases,
-        dialog_cases=dialog_cases,
-    )
+    async with _eval_lock:
+        report = await _evaluator.run(
+            intent_cases=intent_cases,
+            dialog_cases=dialog_cases,
+        )
     return _eval_report_payload(report, include_results=True)
 
 

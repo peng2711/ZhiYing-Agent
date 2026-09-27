@@ -1,10 +1,12 @@
 name: zhiying-agent
 
 services:
+  # 所有端口只绑定本机：Redis/Chroma 无密码，前端代理会为请求注入 API Key，
+  # 暴露到局域网等同于开放知识库管理和评测接口。需要对外提供服务时请改用反向代理并单独鉴权。
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -16,7 +18,7 @@ services:
   chromadb:
     image: chromadb/chroma:0.5.23
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
     environment:
       IS_PERSISTENT: "TRUE"
       PERSIST_DIRECTORY: /chroma/chroma
@@ -37,7 +39,7 @@ services:
     env_file:
       - ./backend/.env
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       REDIS_URL: redis://redis:6379/0
       CHROMA_HOST: chromadb
@@ -63,7 +65,7 @@ services:
     env_file:
       - ./backend/.env
     ports:
-      - "5173:80"
+      - "127.0.0.1:5173:80"
     depends_on:
       - backend
 

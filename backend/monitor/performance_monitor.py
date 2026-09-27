@@ -6,8 +6,8 @@
 本模块的答案：
   1. 实时采集 —— 每隔 N 秒从 Orchestrator 和 ToolManager 拉取最新统计
   2. 异常检测 —— Z-score 统计方法，自动发现指标突变
-  3. 路由反馈 —— 将 Agent 成功率/延迟写回 Orchestrator，
-     Orchestrator 的 _best_agent() 会据此动态调整路由权重
+  3. 路由反馈 —— 将 Agent 成功率/延迟折算为惩罚写回 Orchestrator；
+     只有同类 Agent 存在多个实例时才会影响选择，当前每类一个实例，仅体现在统计中
   4. 优化建议 —— 基于规则生成可操作的优化建议（不是空话）
   5. 告警 —— 超阈值时打日志 + 可选 Webhook
 """
@@ -103,11 +103,10 @@ class PerformanceMonitor:
     Agent 在线表现监控。
 
     与 Orchestrator 的联动：
-      Monitor 采集 → 发现某 Agent 成功率下降 →
-      Orchestrator.get_stats() 中该 Agent 的 routing_score 自动降低 →
-      _best_agent() 路由时自动绕开该 Agent
-
-    这就是"利用 Monitor 监控在线表现"的闭环。
+      Monitor 采集 → 发现某 Agent 成功率下降或变慢 → 告警 →
+      Orchestrator.get_stats() 中该 Agent 的 routing_score 降低。
+      同类存在多个实例时 _best_agent() 会优先选择得分高的实例；
+      当前每类只有一个实例，因此不会改变路由结果。
     """
 
     # 告警阈值
