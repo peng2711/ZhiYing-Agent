@@ -254,6 +254,28 @@ def create_handoff_summary(req: Request, args: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+def request_human_handoff(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+    """专业 Agent 的显式升级信号；编排器据此转交 EscalationAgent 创建工单。"""
+    return {
+        "success": True,
+        "handoff_requested": True,
+        "reason": str(args.get("reason", ""))[:200],
+    }
+
+
+def handoff_tools() -> Dict[str, AgentToolSpec]:
+    return {
+        "request_human_handoff": make_tool(
+            "request_human_handoff",
+            "问题满足升级条件、必须由人工客服介入时调用；调用后系统会创建人工工单。"
+            "仅在回复里建议用户可联系人工时不要调用。",
+            {"reason": {"type": "string", "description": "需要人工介入的原因"}},
+            request_human_handoff,
+            required=["reason"],
+        ),
+    }
+
+
 def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
     """构建所有 Agent 可共享的 RAG 工具。"""
 

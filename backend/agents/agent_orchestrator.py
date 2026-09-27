@@ -35,6 +35,7 @@ from agents.tools import (
     billing_tools,
     escalation_tools,
     general_tools,
+    handoff_tools,
     technical_tools,
 )
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel, intent_group_for
@@ -139,6 +140,7 @@ class _AgentRun:
     citations: List[Dict[str, Any]] = field(default_factory=list)
     pending_action: Optional[Dict[str, Any]] = None
     ticket: Optional[Dict[str, Any]] = None
+    escalate: bool = False
 
 
 @dataclass
@@ -240,13 +242,12 @@ class BaseAgent:
             ms = (time.monotonic() - t0) * 1000
             self.stats.success += 1
             self.stats.total_ms += ms
-            escalate = self._needs_escalation(content)
             return AgentResponse(
                 agent_type=self.agent_type,
                 content=content,
                 success=True,
                 latency_ms=ms,
-                escalate=escalate,
+                escalate=run.escalate,
                 tools_attempted=list(run.tools_attempted),
                 tools_used=list(run.tools_used),
                 tool_traces=list(run.tool_traces),
@@ -387,6 +388,8 @@ class BaseAgent:
                                        if key not in {"success", "confirmation_token"}}}
                             elif name == "create_ticket" and isinstance(result, dict):
                                 run.ticket = result.get("ticket")
+                            elif name == "request_human_handoff":
+                                run.escalate = True
                     except Exception as ex:
                         call_success = False
                         logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
@@ -450,6 +453,10 @@ class BaseAgent:
 
     def _build_system_prompt(self, req: Request) -> str:
         """把角色契约和动态 Skills 拼入 system prompt。"""
+        handoff_hint = (
+            "满足升级条件时必须调用 request_human_handoff 工具，只在文字里写“转人工”不会触发升级。\n"
+            if "request_human_handoff" in self.get_tools() else ""
+        )
         profile_prompt = (
             f"\n\n[角色契约]\n"
             f"角色：{self.profile.role}\n"
@@ -459,6 +466,7 @@ class BaseAgent:
             f"输出要求：{'；'.join(self.profile.output_contract)}\n"
             f"升级条件：{'；'.join(self.profile.handoff_conditions) or '无，按通用客服规则处理'}\n"
             f"允许的数据/工具范围：{'、'.join(self.profile.tool_scope) or '仅使用当前请求上下文'}\n"
+            f"{handoff_hint}"
             "不要声称执行了未提供的查询、修改或退款操作；缺少证据时明确说明需要核验。"
         )
         # 统一的回答协议：让各专业 Agent 的输出可执行、可校验，减少
@@ -508,11 +516,6 @@ class BaseAgent:
         }
         return json.dumps(packet, ensure_ascii=False)
 
-    def _needs_escalation(self, content: str) -> bool:
-        """检测 Agent 是否建议升级（简单关键词检测）。"""
-        keywords = ["转人工", "人工客服", "escalate", "specialist", "无法处理"]
-        return any(kw in content for kw in keywords)
-
 
 class GeneralAgent(BaseAgent):
     agent_type    = AgentType.GENERAL
@@ -523,7 +526,7 @@ class GeneralAgent(BaseAgent):
         input_contract=("对话历史", "用户画像", "意图与紧急度", "知识库上下文"),
         output_contract=("先回应核心问题", "信息不足时只询问必要字段", "明确下一步和边界"),
         handoff_conditions=("涉及权限、资金、隐私或复杂投诉", "用户明确要求人工"),
-        tool_scope=("search_knowledge_base", "get_order", "get_logistics", "inspect_request_context", "suggest_required_fields"),
+        tool_scope=("search_knowledge_base", "get_order", "get_logistics", "inspect_request_context", "suggest_required_fields", "request_human_handoff"),
         temperature=0.3,
         max_tokens=900,
     )
@@ -541,6 +544,7 @@ class GeneralAgent(BaseAgent):
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         tools = super().get_tools()
         tools.update(general_tools())
+        tools.update(handoff_tools())
         return tools
 
 
@@ -553,7 +557,7 @@ class TechnicalAgent(BaseAgent):
         input_contract=("错误码", "问题发生时间", "运行环境", "影响范围", "最近变更", "知识库上下文"),
         output_contract=("现象复述", "可能原因", "编号排查步骤", "验证结果", "需要补充的信息"),
         handoff_conditions=("生产大面积不可用", "数据丢失或权限异常", "需要后台日志、数据库或人工操作"),
-        tool_scope=("search_knowledge_base", "lookup_error_code", "build_diagnostic_plan"),
+        tool_scope=("search_knowledge_base", "lookup_error_code", "build_diagnostic_plan", "request_human_handoff"),
         temperature=0.1,
         max_tokens=1200,
     )
@@ -574,6 +578,7 @@ class TechnicalAgent(BaseAgent):
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         tools = super().get_tools()
         tools.update(technical_tools())
+        tools.update(handoff_tools())
         return tools
 
 
@@ -586,7 +591,7 @@ class BillingAgent(BaseAgent):
         input_contract=("订单号", "金额与币种", "支付时间", "支付渠道", "用户期望", "知识库上下文"),
         output_contract=("需要核验的信息", "当前可判断内容", "下一步处理路径", "时效边界"),
         handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
-        tool_scope=("search_knowledge_base", "get_order", "check_refund_eligibility", "prepare_refund", "get_refund_status", "check_billing_fields", "compare_amounts"),
+        tool_scope=("search_knowledge_base", "get_order", "check_refund_eligibility", "prepare_refund", "get_refund_status", "check_billing_fields", "compare_amounts", "request_human_handoff"),
         temperature=0.0,
         max_tokens=1100,
     )
@@ -614,6 +619,7 @@ class BillingAgent(BaseAgent):
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         tools = super().get_tools()
         tools.update(billing_tools())
+        tools.update(handoff_tools())
         return tools
 
 
@@ -804,7 +810,7 @@ class AgentOrchestrator:
         self,
         api_key:  str,
         base_url: Optional[str] = None,
-        model:    str = "claude-3-5-sonnet-20241022",
+        model:    str = "qwen3.7-plus",
         skill_manager: Optional[Any] = None,
         rag_tool_manager: Optional[Any] = None,
         business_workflow: Optional[Any] = None,
@@ -1326,39 +1332,6 @@ class AgentOrchestrator:
             f"intent={intent}, group={req.intent_group or 'unknown'}, "
             f"primary={primary_agent.value}, supporting={support_text}, scores=[{score_text}]"
         )
-
-    def _collaboration_targets(self, req: Request) -> List[AgentType]:
-        """
-        判断是否需要多个 Agent 并行协作。
-
-        意图识别通常只返回一个主意图；这里用领域关键词补充检测复合问题，
-        例如"登录报错且被重复扣款"需要技术和账单 Agent 同时处理。
-        """
-        msg = req.message.lower()
-        targets: List[AgentType] = []
-
-        technical_kws = ["崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500", "401"]
-        billing_kws = ["退款", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice"]
-
-        if req.intent in (
-            IntentCategory.TECHNICAL,
-            IntentCategory.TECHNICAL_LOGIN,
-            IntentCategory.TECHNICAL_CRASH,
-        ) or any(kw in msg for kw in technical_kws):
-            targets.append(AgentType.TECHNICAL)
-        if req.intent in (
-            IntentCategory.BILLING,
-            IntentCategory.ACCOUNT,
-            IntentCategory.ACCOUNT_SECURITY,
-            IntentCategory.REFUND,
-            IntentCategory.INVOICE,
-            IntentCategory.PAYMENT_ISSUE,
-        ) or any(kw in msg for kw in billing_kws):
-            targets.append(AgentType.BILLING)
-
-        # 保持顺序去重，并只返回当前有实例的 Agent 类型。
-        deduped = list(dict.fromkeys(targets))
-        return [agent_type for agent_type in deduped if self._pool.get(agent_type)]
 
     def _current_explicit_goals(self, req: Request) -> List[IntentCategory]:
         """读取当前轮明确目标；历史 primary_intents 不参与本轮重复执行。"""

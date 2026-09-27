@@ -126,12 +126,13 @@ def test_agent_tool_scopes_are_real_and_isolated():
     billing_tools = set(BillingAgent(FakeClient(), "test-model").get_tools())
     escalation_tools = set(EscalationAgent(FakeClient(), "test-model").get_tools())
 
-    assert general_tools == {"inspect_request_context", "suggest_required_fields"}
-    assert technical_tools == {"lookup_error_code", "build_diagnostic_plan"}
-    assert billing_tools == {"check_billing_fields", "compare_amounts"}
+    handoff = {"request_human_handoff"}
+    assert general_tools == {"inspect_request_context", "suggest_required_fields"} | handoff
+    assert technical_tools == {"lookup_error_code", "build_diagnostic_plan"} | handoff
+    assert billing_tools == {"check_billing_fields", "compare_amounts"} | handoff
     assert escalation_tools == {"create_handoff_summary"}
-    assert not general_tools & technical_tools
-    assert not technical_tools & billing_tools
+    assert general_tools & technical_tools == handoff
+    assert technical_tools & billing_tools == handoff
 
 
 def test_shared_rag_tool_is_available_to_all_agents():
@@ -213,6 +214,7 @@ def test_tool_use_round_trip_executes_only_whitelisted_tool():
     assert {tool["name"] for tool in client.calls[0]["tools"]} == {
         "lookup_error_code",
         "build_diagnostic_plan",
+        "request_human_handoff",
     }
     assert "tool_result" in str(client.calls[1]["messages"])
 
@@ -378,3 +380,65 @@ def test_concurrent_requests_do_not_share_pending_action():
     assert response_b.pending_action is None
     assert response_b.tools_attempted == []
     assert response_c.pending_action is None
+
+
+class _ScriptedClient:
+    """按顺序返回预设响应的 LLM 客户端。"""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+
+        class Messages:
+            async def create(inner, **kwargs):
+                return self.responses.pop(0)
+
+        self.messages = Messages()
+
+
+def _blocks(*blocks):
+    return type("Response", (), {"content": list(blocks)})()
+
+
+def test_mentioning_human_support_in_text_does_not_escalate():
+    client = _ScriptedClient(_blocks({"type": "text", "text": "可以按以下步骤操作，如仍有疑问可联系人工客服。"}))
+    agent = GeneralAgent(client, "test-model")
+
+    response = asyncio.run(agent.handle(make_request(intent=IntentCategory.QUERY, entities={})))
+
+    assert response.success is True
+    assert response.escalate is False
+
+
+def test_explicit_handoff_tool_escalates_and_orchestrator_creates_ticket():
+    client = _ScriptedClient(
+        _blocks({"type": "tool_use", "id": "toolu_h", "name": "request_human_handoff",
+                 "input": {"reason": "需要后台核对账户权限"}}),
+        _blocks({"type": "text", "text": "该问题需要人工核对，已为您转交。"}),
+    )
+    orchestrator = AgentOrchestrator(api_key="test", model="test-model")
+    for agent in orchestrator._pool[AgentType.GENERAL]:
+        agent._client = client
+    tickets = []
+    orchestrator.set_domain_tools({"escalation": {"create_ticket": build_ticket_tool(tickets)}})
+
+    result = asyncio.run(orchestrator.run(make_request(
+        message="我的账号权限异常", intent=IntentCategory.QUERY, intent_group="general",
+        urgency=UrgencyLevel.MEDIUM, entities={},
+    )))
+
+    assert result.escalated is True
+    assert "request_human_handoff" in result.tools_used
+    assert result.ticket == {"ticket_id": "CS-TEST", "status": "open"}
+    assert len(tickets) == 1
+
+
+def build_ticket_tool(tickets):
+    from agents.tools import make_tool
+
+    def create_ticket(req, args):
+        tickets.append(args)
+        return {"success": True, "ticket": {"ticket_id": "CS-TEST", "status": "open"}}
+
+    return make_tool("create_ticket", "创建工单",
+                     {"issue_type": {"type": "string"}, "priority": {"type": "string"}, "summary": {"type": "string"}},
+                     create_ticket, ["issue_type", "priority", "summary"], "write")
