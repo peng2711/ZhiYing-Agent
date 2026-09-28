@@ -1,5 +1,5 @@
 """
-亮点：MCP 工具调用框架
+进程内工具调用框架（注意：不是 MCP 协议，MCP 适配见 mcp_server.py 和 mcp_client.py）
 
 核心问题：工具调用出错（检索不全、召回不好）怎么优化？
 
@@ -144,11 +144,11 @@ class Tool:
     breaker: CircuitBreaker = field(default_factory=CircuitBreaker, init=False)
 
 
-# ── MCP 工具管理器 ────────────────────────────────────────────────────────────
+# ── 工具管理器 ────────────────────────────────────────────────────────────────
 
-class MCPToolManager:
+class ToolManager:
     """
-    MCP 工具调用框架。
+    进程内工具调用框架。
 
     核心优化链路（针对检索类工具）：
       用户查询 → 查询改写（多角度子查询）→ 并行召回 → 结果重排 → 返回 Top-K

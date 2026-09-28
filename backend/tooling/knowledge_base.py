@@ -4,7 +4,7 @@ RAG 知识库 —— 基于 ChromaDB 的真实检索实现。
 功能：
   1. 文档导入：将文本切片后存入 ChromaDB（自动生成 Embedding）
   2. 语义检索：根据 query 从知识库中检索最相关的文档片段
-  3. 与 MCP 工具框架集成：作为 knowledge_search 工具的真实 handler
+  3. 与工具管理器集成：作为 knowledge_search 工具的真实 handler
 
 ChromaDB 在这里的角色：
   - memory/ 中用于存储对话记忆（情景记忆 + 用户画像）
@@ -304,13 +304,13 @@ class KnowledgeBase:
     async def delete_version_async(self, source_id: str, version: str) -> int:
         return await asyncio.to_thread(self.delete_version, source_id, version)
 
-    # ── MCP 工具 handler ─────────────────────────────────────────────────────
+    # ── 工具 handler ─────────────────────────────────────────────────────────
 
     async def search_handler(self, params: Dict[str, Any], context: Any) -> List[Dict]:
         """
-        作为 MCP 工具的 handler 注册。
+        作为工具管理器的 handler 注册。
 
-        MCPToolManager.register(Tool(
+        ToolManager.register(Tool(
             name="knowledge_search",
             handler=kb.search_handler,
             ...

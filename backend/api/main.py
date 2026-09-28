@@ -92,8 +92,8 @@ async def lifespan(app: FastAPI):
     from business import BusinessWorkflow, MockBusinessBackend
     from core.intent_recognizer import IntentRecognizer
     from evaluation.evaluator import EndToEndEvaluator
-    from mcp.knowledge_base import KnowledgeBase
-    from mcp.tool_manager import MCPToolManager, Tool
+    from tooling.knowledge_base import KnowledgeBase
+    from tooling.tool_manager import ToolManager, Tool
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
@@ -142,8 +142,8 @@ async def lifespan(app: FastAPI):
     _orchestrator.set_domain_tools(build_business_tools(_business_backend, _memory))
     _orchestrator.set_business_workflow(BusinessWorkflow(_business_backend, _memory))
 
-    # MCP 工具管理器 + RAG 知识库（基于 ChromaDB 的真实检索）
-    _tool_manager = MCPToolManager(
+    # 工具管理器 + RAG 知识库（基于 ChromaDB 的真实检索）
+    _tool_manager = ToolManager(
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
@@ -582,7 +582,7 @@ async def prometheus_metrics():
 async def search(query: str = Query(min_length=1, max_length=8000), top_k: int = Query(default=5, ge=1, le=10)):
     """
     演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
-    展示 MCP 工具调用的核心亮点。
+    展示工具调用框架的检索优化链路。
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")

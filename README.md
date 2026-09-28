@@ -261,7 +261,7 @@ ZhiYing-Agent/
 │   ├── agents/          # Agent 定义、路由与工具循环
 │   ├── api/             # FastAPI 接口
 │   ├── core/            # 意图识别、LLM 适配与 Skills
-│   ├── mcp/             # 工具管理和 RAG 知识库
+│   ├── tooling/         # 工具管理和 RAG 知识库
 │   ├── memory/          # Redis + ChromaDB 分层记忆
 │   ├── monitor/         # 指标和告警
 │   ├── evaluation/      # 自动化评测
