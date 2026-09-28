@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from core.llm_utils import extract_text_content
 from core.usage import llm_role, track_request_usage
-from core.llm_client import LLMClient, create_llm_client
+from core.llm_client import LLMClient, create_llm_client, role_model
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer, intent_group_for
 from evaluation.business_evaluator import BusinessWorkflowEvaluator
@@ -125,7 +125,7 @@ Agent 响应: {response}
 
     def __init__(self, client: LLMClient, model: str):
         self._client = client
-        self._model  = model
+        self._model  = role_model("judge", model)
 
     async def judge(
         self,

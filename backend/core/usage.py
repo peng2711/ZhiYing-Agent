@@ -65,11 +65,13 @@ class RequestUsage:
 
     def summary(self) -> Dict[str, Any]:
         by_role: Dict[str, Dict[str, int]] = {}
+        by_model: Dict[str, Dict[str, int]] = {}
         for call in self.calls:
-            bucket = by_role.setdefault(call["role"], {"calls": 0, "input_tokens": 0, "output_tokens": 0})
-            bucket["calls"] += 1
-            bucket["input_tokens"] += call["input_tokens"]
-            bucket["output_tokens"] += call["output_tokens"]
+            for key, groups in ((call["role"], by_role), (call["model"], by_model)):
+                bucket = groups.setdefault(key, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
+                bucket["calls"] += 1
+                bucket["input_tokens"] += call["input_tokens"]
+                bucket["output_tokens"] += call["output_tokens"]
         result: Dict[str, Any] = {
             "llm_calls": len(self.calls),
             "input_tokens": sum(c["input_tokens"] for c in self.calls),
@@ -77,6 +79,7 @@ class RequestUsage:
             "cached_input_tokens": sum(c["cached_input_tokens"] for c in self.calls),
             "unreported_calls": sum(1 for c in self.calls if not c["reported"]),
             "by_role": by_role,
+            "by_model": by_model,
         }
         cost = estimate_cost(self.calls)
         if cost is not None:

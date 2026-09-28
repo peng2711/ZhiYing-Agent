@@ -26,7 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.llm_utils import extract_text_content
 from core.usage import llm_role
-from core.llm_client import create_llm_client
+from core.llm_client import create_llm_client, role_model
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +164,8 @@ class ToolManager:
             kwargs["base_url"] = base_url
         self._client = create_llm_client(api_key=api_key, base_url=base_url)
         self._model  = model
+        self._rewrite_model = role_model("rewrite", model)
+        self._rerank_model = role_model("rerank", model)
         self._tools: Dict[str, Tool] = {}
         self._cache: Dict[str, tuple] = {}   # key → (result, expire_at, reranked)
 
@@ -345,7 +347,7 @@ class ToolManager:
             with llm_role("query_rewrite"):
                 resp = await asyncio.wait_for(
                     self._client.messages.create(
-                        model=self._model, max_tokens=256, temperature=0.3,
+                        model=self._rewrite_model, max_tokens=256, temperature=0.3,
                         messages=[{"role": "user", "content": prompt}],
                     ),
                     timeout=_llm_timeout_s(),
@@ -494,7 +496,7 @@ class ToolManager:
             with llm_role("rerank"):
                 resp = await asyncio.wait_for(
                     self._client.messages.create(
-                        model=self._model, max_tokens=256, temperature=0.0,
+                        model=self._rerank_model, max_tokens=256, temperature=0.0,
                         messages=[{"role": "user", "content": prompt}],
                     ),
                     timeout=_llm_timeout_s(),

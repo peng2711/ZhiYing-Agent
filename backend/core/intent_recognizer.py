@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from core.llm_utils import extract_text_content
 from core.usage import llm_role
-from core.llm_client import LLMClient, create_llm_client
+from core.llm_client import LLMClient, create_llm_client, role_model
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +178,7 @@ class IntentRecognizer:
         if base_url:
             kwargs["base_url"] = base_url
         self.client    = create_llm_client(api_key=api_key, base_url=base_url)
-        self.model     = model
+        self.model     = role_model("intent", model)
         self.threshold = confidence_threshold
         # 本地字符 n-gram 向量始终可用；如果未来客户端暴露 embeddings 资源，
         # _embed_text 会优先尝试远端向量，否则自动回退本地向量。

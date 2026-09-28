@@ -43,7 +43,7 @@ from agents.tools import (
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel, intent_group_for
 from core.usage import current_request_usage, llm_role
 from core.llm_utils import extract_text_content
-from core.llm_client import LLMClient, create_llm_client
+from core.llm_client import LLMClient, create_llm_client, role_model
 from core.task_intent import TaskIntentTracker
 
 logger = logging.getLogger(__name__)
@@ -751,7 +751,7 @@ class ResponseComposer:
 
     def __init__(self, client: LLMClient, model: str, skill_manager: Optional[Any] = None):
         self._client = client
-        self._model = model
+        self._model = role_model("composer", model)
         self._skill_manager = skill_manager
 
     async def compose(self, req: Request, responses: List[AgentResponse]) -> str:
