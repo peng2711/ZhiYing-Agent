@@ -128,6 +128,11 @@ class AgentResponse:
     citations: List[Dict[str, Any]] = field(default_factory=list)
     pending_action: Optional[Dict[str, Any]] = None
     ticket: Optional[Dict[str, Any]] = None
+    error: str = ""
+
+
+class AgentBudgetExceeded(RuntimeError):
+    """Agent 工具循环超出预算或判定为无进展，主动停止并交给上层降级。"""
 
 
 @dataclass
@@ -273,6 +278,7 @@ class BaseAgent:
                 latency_ms=ms,
                 tools_attempted=list(run.tools_attempted),
                 tool_traces=list(run.tool_traces),
+                error=str(ex),
             )
 
     async def _call_llm(self, req: Request, run: _AgentRun) -> str:
@@ -296,6 +302,12 @@ class BaseAgent:
         tools = self.get_tools()
         max_rounds = max(1, min(_env_int("ZHIYING_MAX_TOOL_ROUNDS", 3), 8))
         llm_timeout = max(1.0, _env_float("ZHIYING_LLM_TIMEOUT_S", 45.0))
+        # 三层终止条件：最大轮数（上面）、整次 Agent 执行的时间预算、单次请求的 token 预算；
+        # 另外检测"同一工具同样参数"的重复调用，模型原地打转时不必等到轮数耗尽。
+        deadline = time.monotonic() + max(1.0, _env_float("ZHIYING_AGENT_DEADLINE_S", 90.0))
+        token_budget = max(0, _env_int("ZHIYING_REQUEST_TOKEN_BUDGET", 0))
+        seen_calls: Dict[str, int] = {}
+        duplicate_calls = 0
         # 意图分类可能把“退款政策是什么”归为通用 QUERY。对明确询问政策、
         # 规则或依据的问题仍强制检索，避免仅凭模型参数记忆回答且没有引用。
         knowledge_markers = (
@@ -318,6 +330,14 @@ class BaseAgent:
         tool_traces = run.tool_traces
         citations = run.citations
         for round_idx in range(max_rounds):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AgentBudgetExceeded(f"{self.agent_type.value} 超出执行时间预算")
+            if token_budget:
+                usage = current_request_usage()
+                spent = usage.summary() if usage is not None else {}
+                if spent.get("input_tokens", 0) + spent.get("output_tokens", 0) >= token_budget:
+                    raise AgentBudgetExceeded(f"{self.agent_type.value} 超出单次请求 token 预算 {token_budget}")
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
                 "max_tokens": self.profile.max_tokens,
@@ -343,7 +363,7 @@ class BaseAgent:
             with llm_role(f"agent:{self.agent_type.value}"):
                 resp = await asyncio.wait_for(
                     self._client.messages.create(**request_kwargs),
-                    timeout=llm_timeout,
+                    timeout=min(llm_timeout, remaining),
                 )
             tool_uses = [block for block in (resp.content or []) if self._block_type(block) == "tool_use"]
             if not tool_uses:
@@ -364,7 +384,21 @@ class BaseAgent:
                 call_success = True
                 result_success: Optional[bool] = None
                 error_text = ""
-                if spec is None:
+                signature = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
+                is_duplicate = seen_calls.get(signature, 0) > 0
+                seen_calls[signature] = seen_calls.get(signature, 0) + 1
+                if is_duplicate:
+                    duplicate_calls += 1
+                    if duplicate_calls >= 2:
+                        raise AgentBudgetExceeded(f"{self.agent_type.value} 反复用相同参数调用 {name}，判定为无进展")
+                    # 第一次重复不执行，把原因告诉模型，给它一次换思路的机会。
+                    call_success = False
+                    result = {"success": False, "error": (
+                        f"{name} 已经用相同参数调用过，结果在上文。不要重复调用，"
+                        "请基于已有结果回答，或者换一个参数。"
+                    )}
+                    error_text = result["error"]
+                elif spec is None:
                     call_success = False
                     result: Any = {"success": False, "error": f"工具不在 {self.agent_type.value} Agent 白名单中"}
                     error_text = result["error"]
