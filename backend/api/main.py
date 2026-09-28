@@ -55,6 +55,7 @@ _monitor      = None
 _evaluator    = None
 _skill_manager = None
 _business_backend = None
+_mcp_provider = None
 # 完整评测会触发上百次 LLM 调用，同一进程内只允许一个评测运行，避免重复触发放大成本。
 _eval_lock = asyncio.Lock()
 
@@ -84,6 +85,7 @@ def _chroma_cfg() -> Dict[str, Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _business_backend
+    global _mcp_provider
 
     print(BANNER, flush=True)
 
@@ -184,6 +186,14 @@ async def lifespan(app: FastAPI):
     if _orchestrator is not None:
         _orchestrator.set_shared_tools(build_shared_rag_tools(_tool_manager))
 
+    # 外部 MCP Server：按 ZHIYING_MCP_SERVERS 配置连接，把显式允许的只读工具挂进对应 Agent。
+    from tooling.mcp_client import MCPToolProvider, load_configs_from_env
+    mcp_configs = load_configs_from_env()
+    if mcp_configs:
+        _mcp_provider = MCPToolProvider(mcp_configs)
+        await _mcp_provider.start()
+        _orchestrator.set_external_tools(_mcp_provider.tools_by_agent())
+
     # 性能监控（可选启动 Prometheus）
     prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
     _monitor = PerformanceMonitor(
@@ -209,6 +219,8 @@ async def lifespan(app: FastAPI):
     yield
 
     await _monitor.stop()
+    if _mcp_provider is not None:
+        await _mcp_provider.close()
     if _memory is not None:
         await _memory.close()
     logger.info("ZhiYing Agent 已关闭")
@@ -394,6 +406,12 @@ async def skills_summary():
     if _skill_manager is None:
         raise HTTPException(503, "Skills 未初始化")
     return _skill_manager.summary()
+
+
+@app.get("/mcp/servers", tags=["MCP"])
+async def mcp_servers_summary():
+    """查看外部 MCP Server 的连接状态，以及每个 Server 挂载和跳过的工具。"""
+    return {"servers": _mcp_provider.summary() if _mcp_provider is not None else []}
 
 
 @app.post("/skills/reload", tags=["Skills"])

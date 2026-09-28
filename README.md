@@ -31,6 +31,7 @@
 - **可观测链路**：记录请求 ID、路由结果、工具输入、缓存状态、重排状态和耗时。
 - **自动化评测**：提供意图识别、LLM-as-Judge、业务 E2E、安全确认、RAG 引用覆盖、P95 延迟和回归基线，并在前端展示发布级指标与逐条用例证据。
 - **动态 Skills**：业务规则以 Markdown Skill 维护，运行时按 Agent 注入。
+- **MCP**：知识库以 MCP Server 对外提供只读检索（stdio / Streamable HTTP）；Agent 也能作为 MCP Client 挂载外部 Server 的只读工具，仍走白名单、参数校验和 Trace。
 - **业务执行闭环**：支持模拟订单/物流查询、退款资格检查、退款执行和人工工单。
 - **安全确认**：退款采用 Redis 任务状态与两阶段确认，具有确认令牌、有效期和幂等保护。
 - **知识引用**：回答返回文档、版本、章节、更新时间和 chunk 等结构化来源。
@@ -178,6 +179,20 @@ Invoke-RestMethod `
   -InFile ./backend/examples/knowledge.json
 ```
 
+### 5. MCP（可选）
+
+知识库可以作为 MCP Server 单独运行，供 Claude Desktop、Claude Code 等 MCP 客户端调用：
+
+```bash
+cd backend
+python -m tooling.mcp_server                                  # stdio
+python -m tooling.mcp_server --transport streamable-http      # http://127.0.0.1:8765/mcp
+```
+
+只暴露 `search_knowledge_base` 和 `list_knowledge_versions` 两个只读工具。订单、退款、工单不走 MCP：MCP Server 拿不到调用方的登录身份，暴露它们等于绕过接口鉴权。
+
+反过来，后端也能挂载外部 MCP Server 的工具。在 `backend/.env` 中配置 `ZHIYING_MCP_SERVERS`（格式见 `.env.example`），只有显式列在 `tools` 中、并且 Server 声明为只读的工具才会挂进指定 Agent，工具名带 `mcp_<server>_` 前缀，不能覆盖内置工具。挂载结果可通过 `GET /mcp/servers` 查看。
+
 ## Docker Compose
 
 复制并填写配置：
@@ -261,7 +276,7 @@ ZhiYing-Agent/
 │   ├── agents/          # Agent 定义、路由与工具循环
 │   ├── api/             # FastAPI 接口
 │   ├── core/            # 意图识别、LLM 适配与 Skills
-│   ├── tooling/         # 工具管理和 RAG 知识库
+│   ├── tooling/         # 工具管理、RAG 知识库、MCP Server 与 Client
 │   ├── memory/          # Redis + ChromaDB 分层记忆
 │   ├── monitor/         # 指标和告警
 │   ├── evaluation/      # 自动化评测

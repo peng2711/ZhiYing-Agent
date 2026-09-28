@@ -224,16 +224,20 @@ class BaseAgent:
         self.stats   = AgentStats()
         self._shared_tools: Dict[str, AgentToolSpec] = {}
         self._domain_tools: Dict[str, AgentToolSpec] = {}
+        self._external_tools: Dict[str, AgentToolSpec] = {}
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
-        """返回该角色真实可调用的工具白名单。"""
-        return {**self._shared_tools, **self._domain_tools}
+        """返回该角色真实可调用的工具白名单。外部 MCP 工具放在最前，不能覆盖内置工具。"""
+        return {**self._external_tools, **self._shared_tools, **self._domain_tools}
 
     def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
         self._shared_tools = dict(tools or {})
 
     def set_domain_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
         self._domain_tools = dict(tools or {})
+
+    def set_external_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
+        self._external_tools = dict(tools or {})
 
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
@@ -876,6 +880,13 @@ class AgentOrchestrator:
         for agent_type, agents in self._pool.items():
             for agent in agents:
                 agent.set_domain_tools(configured.get(agent_type.value, {}))
+
+    def set_external_tools(self, tools_by_agent: Optional[Dict[str, Dict[str, AgentToolSpec]]]) -> None:
+        """挂载外部 MCP Server 提供的只读工具，按角色分配。"""
+        configured = tools_by_agent or {}
+        for agent_type, agents in self._pool.items():
+            for agent in agents:
+                agent.set_external_tools(configured.get(agent_type.value, {}))
 
     def set_business_workflow(self, workflow: Optional[Any]) -> None:
         self._business_workflow = workflow
