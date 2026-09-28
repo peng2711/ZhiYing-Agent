@@ -4,6 +4,7 @@
 anthropic==0.40.0          # LLM 调用；意图 Embedding 分支支持远端客户端，缺失时本地兜底
 openai>=1.109.1,<2        # Qwen / DeepSeek OpenAI-compatible Tool Calling
 mcp>=1.12,<2              # Model Context Protocol：知识库 MCP Server 和外部工具 Client
+fastembed>=0.8,<0.9       # 可选中文 embedding（bge-small-zh，ONNX 运行，不依赖 PyTorch）
 
 # ── Web 框架 ──────────────────────────────────────────────────────────────────
 fastapi==0.115.5

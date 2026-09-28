@@ -83,7 +83,27 @@ flowchart LR
 - `dialog_intent_match`：当前一轮意图是否匹配逐轮标签。
 - `primary_task_retention`：多轮结束时是否仍保留全部主任务。
 
-这些业务指标不使用 LLM 打分，也不会修改演示数据库。项目不在 README 中预填虚构效果数字，实际结果以当前代码运行 `/eval/run` 的报告为准。
+这些业务指标不使用 LLM 打分，也不会修改演示数据库。项目不在 README 中预填虚构效果数字，实际结果以当前代码运行 `/eval/run` 的报告为准。对话评测还会输出 `avg_tokens_per_turn` 和 `avg_llm_calls_per_turn`（只统计线上链路，不含 Judge），上涨超过 5% 视为回归。
+
+### 检索评测
+
+`retrieval_corpus.json` 是 42 篇自建的模拟客服政策（含一组新旧版本和多组易混淆文档），`retrieval_cases.json` 是 87 条口语化查询及其应命中的文档。评测在临时目录里建独立知识库，按文档计算 Hit@K、Recall@K 和 MRR，并按查询类型（口语、同义改写、易混淆、精确术语、版本）拆分：
+
+```bash
+cd backend
+python -m evaluation.retrieval_evaluator --embedding default bge-small-zh
+# 需要 LLM 配置时可继续对比查询改写和重排的贡献
+python -m evaluation.retrieval_evaluator --embedding bge-small-zh --modes vector rewrite rerank rewrite+rerank
+```
+
+在这套自建数据上纯向量检索的一次运行结果如下。数据集由同一作者编写，绝对值可能偏乐观，应主要看两个模型之间的差距：
+
+| embedding | Hit@1 | Hit@3 | MRR |
+|---|---|---|---|
+| ChromaDB 默认（all-MiniLM-L6-v2） | 0.172 | 0.333 | 0.288 |
+| bge-small-zh-v1.5 | 0.885 | 0.977 | 0.927 |
+
+默认模型只在含 `401`、`502` 等字面词的查询上有效，口语化中文查询的 Hit@1 只有 0.07。通过 `ZHIYING_EMBEDDING_MODEL=bge-small-zh` 切换（独立 collection，切换后需重新导入知识库）。
 
 ## 设计演进、失败与取舍
 
@@ -97,6 +117,7 @@ flowchart LR
 | 升级只生成一句摘要 | 用户无法获得可追踪处理编号 | 创建持久化工单并返回状态 | 当前不连接真实客服排班系统 |
 | RAG 只把文本塞回模型 | 用户看不到答案依据 | 返回文档、版本、章节、更新时间和 chunk | 引用元数据由服务端生成，避免模型编造来源 |
 | 本地跨端口请求未携带 Cookie | 访客身份可能逐轮变化，任务状态丢失 | Fetch 统一启用 `credentials: include` | CORS 必须使用明确来源并允许凭据 |
+| 知识库一直用 ChromaDB 默认 embedding | 默认模型以英文为主，中文口语查询 Hit@3 只有 0.33 | 新增检索评测集和 Hit@K/MRR 评测，支持 bge-small-zh | 换模型要换 collection 并重新导入，因此做成配置项而不是静默切换 |
 | 本地与容器 Chroma 默认值混用 | 数据可能写入意外目录 | 本地默认 `localhost:8001` 并回退仓库目录，Compose 显式使用 `chromadb:8000` | 服务模式和嵌入式模式保留同一接口 |
 
 ## 技术栈

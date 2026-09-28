@@ -151,12 +151,18 @@ async def lifespan(app: FastAPI):
         base_url=cfg.get("base_url"),
         model=cfg["model"],
     )
+    from tooling.embeddings import collection_name_for, get_embedding_function
+    embedding_model = os.getenv("ZHIYING_EMBEDDING_MODEL", "default").strip() or "default"
     kb = KnowledgeBase(
         chroma_host=chroma_cfg["host"],
         chroma_port=chroma_cfg["port"],
         chroma_path=chroma_cfg["path"],
+        embedding_function=get_embedding_function(
+            embedding_model, cache_dir=os.getenv("ZHIYING_EMBEDDING_CACHE_DIR") or None,
+        ),
+        collection_name=collection_name_for(embedding_model),
     )
-    logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
+    logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段（embedding={embedding_model}）")
 
     def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
         query = params.get("query", "")

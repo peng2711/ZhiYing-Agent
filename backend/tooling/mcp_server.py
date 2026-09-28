@@ -91,13 +91,19 @@ def build_server(kb: Any, host: str = "127.0.0.1", port: int = 8765) -> FastMCP:
 
 def _default_kb() -> Any:
     """按与 api/main.py 相同的环境变量连接知识库。"""
+    from tooling.embeddings import collection_name_for, get_embedding_function
     from tooling.knowledge_base import KnowledgeBase
 
     root = pathlib.Path(__file__).resolve().parent.parent
+    embedding_model = os.getenv("ZHIYING_EMBEDDING_MODEL", "default").strip() or "default"
     return KnowledgeBase(
         chroma_host=os.getenv("CHROMA_HOST", "localhost").strip() or "localhost",
         chroma_port=int(os.getenv("CHROMA_PORT", "8001")),
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", str(root / "data" / "chroma")),
+        embedding_function=get_embedding_function(
+            embedding_model, cache_dir=os.getenv("ZHIYING_EMBEDDING_CACHE_DIR") or None,
+        ),
+        collection_name=collection_name_for(embedding_model),
     )
 
 
