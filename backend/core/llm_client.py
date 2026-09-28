@@ -154,12 +154,14 @@ def anthropic_tools_to_openai(tools: Optional[Iterable[Dict[str, Any]]]) -> List
 def anthropic_tool_choice_to_openai(choice: Any) -> Any:
     if not isinstance(choice, dict):
         return choice
-    if choice.get("type") == "tool":
+    kind = choice.get("type")
+    if kind == "tool":
         return {
             "type": "function",
             "function": {"name": choice.get("name", "")},
         }
-    return choice
+    # Anthropic 的 auto / any / none 在 OpenAI 协议里是字符串 auto / required / none。
+    return {"auto": "auto", "any": "required", "none": "none"}.get(kind, choice)
 
 
 def openai_response_to_anthropic(response: Any) -> LLMMessageResponse:

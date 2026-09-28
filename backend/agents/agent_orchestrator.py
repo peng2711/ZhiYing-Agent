@@ -338,11 +338,20 @@ class BaseAgent:
                 spent = usage.summary() if usage is not None else {}
                 if spent.get("input_tokens", 0) + spent.get("output_tokens", 0) >= token_budget:
                     raise AgentBudgetExceeded(f"{self.agent_type.value} 超出单次请求 token 预算 {token_budget}")
+            # 最后一轮不再允许调用工具，强制基于已获得的结果作答。否则模型在最后一轮
+            # 仍然调用工具时，已经拿到的信息全部作废，整个请求以"超过最大轮数"失败。
+            final_round = tools and round_idx == max_rounds - 1 and round_idx > 0
+            system_prompt = self._build_system_prompt(req)
+            if final_round:
+                system_prompt += (
+                    "\n\n[本轮不能再调用工具]\n请直接基于上文已获得的工具结果回答用户。"
+                    "如果信息不足，说明还缺什么、用户下一步可以提供什么，不要编造工具没有返回的事实。"
+                )
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
                 "max_tokens": self.profile.max_tokens,
                 "temperature": self.profile.temperature,
-                "system": self._build_system_prompt(req),
+                "system": system_prompt,
                 "messages": messages,
             }
             if tools:
@@ -360,6 +369,9 @@ class BaseAgent:
                         "type": "tool",
                         "name": "search_knowledge_base",
                     }
+                elif final_round:
+                    # 历史里已有 tool_use，不能去掉 tools 定义，只能禁止本轮调用。
+                    request_kwargs["tool_choice"] = {"type": "none"}
             with llm_role(f"agent:{self.agent_type.value}"):
                 resp = await asyncio.wait_for(
                     self._client.messages.create(**request_kwargs),

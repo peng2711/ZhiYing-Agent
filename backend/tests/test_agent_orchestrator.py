@@ -531,3 +531,57 @@ def test_request_token_budget_stops_further_llm_rounds(monkeypatch):
     assert response.success is False
     assert "token 预算" in response.error
     assert len(calls) == 1
+
+
+class _RecordingClient:
+    """按顺序返回预设响应，并记录每次请求的参数。"""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls = []
+        owner = self
+
+        class Messages:
+            async def create(inner, **kwargs):
+                owner.calls.append(kwargs)
+                return owner.responses.pop(0)
+
+        self.messages = Messages()
+
+
+def test_final_round_forbids_tools_and_asks_for_an_answer():
+    executed = []
+    client = _RecordingClient(
+        _tool_call("t1", order_id="A1"),
+        _tool_call("t2", order_id="A2"),
+        _blocks({"type": "text", "text": "没有查到这两个订单，请核对订单号。"}),
+    )
+    agent = GeneralAgent(client, "test-model")
+    agent.set_domain_tools({"lookup_status": _counting_tool(executed)})
+
+    response = asyncio.run(agent.handle(make_request(intent=IntentCategory.QUERY, entities={})))
+
+    assert response.success is True
+    assert len(executed) == 2
+    assert [call.get("tool_choice") for call in client.calls] == [None, None, {"type": "none"}]
+    assert "本轮不能再调用工具" in client.calls[2]["system"]
+    assert "本轮不能再调用工具" not in client.calls[1]["system"]
+    # 工具定义仍然保留：历史里有 tool_use，去掉 tools 会被接口拒绝。
+    assert client.calls[2]["tools"]
+
+
+def test_single_round_still_forces_knowledge_search(monkeypatch):
+    monkeypatch.setenv("ZHIYING_MAX_TOOL_ROUNDS", "1")
+
+    class Rag:
+        async def search(self, tool_name, query, top_k=5, **policy):
+            return type("Result", (), {"success": True, "data": [], "reranked": False})()
+
+    client = _RecordingClient(_blocks({"type": "tool_use", "id": "t1", "name": "search_knowledge_base",
+                                       "input": {"query": "退款政策"}}))
+    agent = GeneralAgent(client, "test-model")
+    agent.set_shared_tools(build_shared_rag_tools(Rag()))
+
+    asyncio.run(agent.handle(make_request(message="退款政策是什么", intent=IntentCategory.REFUND, entities={})))
+
+    assert client.calls[0]["tool_choice"] == {"type": "tool", "name": "search_knowledge_base"}
