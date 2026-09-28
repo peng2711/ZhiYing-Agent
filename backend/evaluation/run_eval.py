@@ -112,6 +112,11 @@ async def run(tag: str, limit_intent: Optional[int], limit_dialog: Optional[int]
     if dialog_overall:
         report.avg_scores["overall"] = round(sum(dialog_overall) / len(dialog_overall), 4)
     intent_result = next((r for r in report.results if r.test_id == "intent_recognition"), None)
+    intent_errors = [
+        {k: case.get(k) for k in ("message", "expected", "predicted", "confidence")}
+        for case in (intent_result.metadata.get("cases", []) if intent_result else [])
+        if case.get("expected") != case.get("predicted")
+    ]
     return {
         "tag": tag,
         "models": {name: os.getenv(name) for name in MODEL_ENV if os.getenv(name)},
@@ -119,7 +124,8 @@ async def run(tag: str, limit_intent: Optional[int], limit_dialog: Optional[int]
         "elapsed_s": round(elapsed, 1),
         "pass_rate": report.pass_rate,
         "avg_scores": report.avg_scores,
-        "intent_per_class": (intent_result.metadata.get("per_class") if intent_result else None),
+        "intent_errors": intent_errors,
+        "intent_confusions": _confusions(intent_errors),
         "usage_by_model": {
             "serving": _merge_usage(turn_usages),
             "intent_eval_and_judge": _merge_usage([outer.summary()]),
@@ -134,6 +140,16 @@ async def run(tag: str, limit_intent: Optional[int], limit_dialog: Optional[int]
     }
 
 
+def _confusions(errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """把错例按"预期 → 预测"分组计数，最常见的混淆排在前面。"""
+    counts: Dict[tuple, int] = {}
+    for error in errors:
+        key = (error["expected"], error["predicted"])
+        counts[key] = counts.get(key, 0) + 1
+    return [{"expected": e, "predicted": p, "count": c}
+            for (e, p), c in sorted(counts.items(), key=lambda item: -item[1])]
+
+
 def _print_summary(result: Dict[str, Any]) -> None:
     s = result["avg_scores"]
     keys = ("intent_accuracy", "overall", "relevance", "accuracy", "completeness", "helpfulness",
@@ -146,6 +162,12 @@ def _print_summary(result: Dict[str, Any]) -> None:
             print(f"  {key:<24}{s[key]}")
     judge_failed = sum(1 for r in result["results"] if r.get("judge_failed"))
     print(f"  judge_failed            {judge_failed}")
+    if result["intent_errors"]:
+        print(f"  意图错例 {len(result['intent_errors'])} 条，按混淆类型：")
+        for item in result["intent_confusions"]:
+            print(f"    {item['expected']} → {item['predicted']}: {item['count']}")
+        for error in result["intent_errors"]:
+            print(f"    [{error['expected']} → {error['predicted']}] {error['message']}")
     for scope, models in result["usage_by_model"].items():
         for name, bucket in models.items():
             print(f"  tokens[{scope}] {name}: {bucket}")
