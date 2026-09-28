@@ -152,7 +152,7 @@ def build_searchers(kb: KnowledgeBase, modes: Sequence[str], top_k: int) -> Dict
     manager = ToolManager(
         api_key=api_key,
         base_url=os.getenv("LLM_BASE_URL") or None,
-        model=os.getenv("LLM_MODEL", "claude-3-5-sonnet-20241022"),
+        model=os.getenv("LLM_MODEL", "qwen3.7-plus"),
     )
     manager.register(Tool(
         name="knowledge_search", description="评测知识库", handler=kb.search_handler,
@@ -225,6 +225,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--cache-dir", default=os.getenv("ZHIYING_EMBEDDING_CACHE_DIR") or None)
     parser.add_argument("--output", help="把完整报告（含每类指标和未命中查询）写入 JSON 文件")
     args = parser.parse_args(argv)
+
+    # 与 API 服务读取同一份 backend/.env，LLM 模式才能拿到 Key 和模型配置。
+    from dotenv import load_dotenv
+    load_dotenv(pathlib.Path(__file__).resolve().parent.parent / ".env")
 
     logging.basicConfig(level=logging.WARNING)
     # chromadb 0.5 与新版 posthog 不兼容，关闭遥测后仍会打印发送失败的错误日志，与评测无关。
