@@ -298,6 +298,9 @@ class BaseAgent:
             messages.append({"role": "user", "content": f"[角色输入契约]\n{_clean(role_packet)}"})
             messages.append({"role": "assistant", "content": "好的，我会按照该角色的输入和输出契约处理。"})
         messages.append({"role": "user", "content": _clean(req.message)})
+        # 工具循环开始前的对话，用于最后一轮的无工具汇总。
+        base_messages = list(messages)
+        tool_outputs: List[Dict[str, Any]] = []
 
         tools = self.get_tools()
         max_rounds = max(1, min(_env_int("ZHIYING_MAX_TOOL_ROUNDS", 3), 8))
@@ -378,6 +381,13 @@ class BaseAgent:
                     timeout=min(llm_timeout, remaining),
                 )
             tool_uses = [block for block in (resp.content or []) if self._block_type(block) == "tool_use"]
+            if final_round and tool_uses:
+                # 部分模型会无视 tool_choice=none（qwen3.7-plus 实测会）。不执行这些调用，
+                # 改为不带工具地再请求一次，把已有结果作为文本交给模型汇总。
+                logger.warning("%s 在禁止调用工具的轮次仍请求工具，改为无工具汇总", self.agent_type.value)
+                return await self._answer_from_tool_outputs(
+                    base_messages, tool_outputs, system_prompt, deadline, llm_timeout,
+                )
             if not tool_uses:
                 if rag_required and round_idx == 0:
                     # 事实类意图不能在首轮绕过知识库，否则模型可能凭常识编造政策。
@@ -466,6 +476,7 @@ class BaseAgent:
                         "error": error_text,
                     }
                 )
+                tool_outputs.append({"tool": name, "input": args, "result": result})
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
@@ -474,6 +485,49 @@ class BaseAgent:
             messages.append({"role": "user", "content": tool_results})
 
         raise RuntimeError(f"{self.agent_type.value} 工具调用超过最大轮数")
+
+    async def _answer_from_tool_outputs(
+        self,
+        base_messages: List[Dict[str, Any]],
+        tool_outputs: List[Dict[str, Any]],
+        system_prompt: str,
+        deadline: float,
+        llm_timeout: float,
+    ) -> str:
+        """不带工具定义，把已获得的工具结果作为文本交给模型作答。
+
+        历史里的 tool_use / tool_result 块被改写成纯文本，所以请求不需要 tools 参数，
+        任何模型都无法再发起工具调用。
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AgentBudgetExceeded(f"{self.agent_type.value} 超出执行时间预算")
+        lines = []
+        for item in tool_outputs:
+            result = json.dumps(item["result"], ensure_ascii=False, default=str)
+            if len(result) > 1500:
+                result = result[:1500] + "…（已截断）"
+            lines.append(f"- {item['tool']}({json.dumps(item['input'], ensure_ascii=False, default=str)}) → {result}")
+        question = base_messages[-1]["content"]
+        messages = base_messages[:-1] + [{"role": "user", "content": (
+            f"{question}\n\n[已获得的工具结果]\n" + ("\n".join(lines) or "（无）")
+            + "\n\n[要求]\n不能再调用工具。请只根据以上结果回答用户的问题；信息不足时说明还缺什么。"
+        )}]
+        with llm_role(f"agent:{self.agent_type.value}"):
+            resp = await asyncio.wait_for(
+                self._client.messages.create(
+                    model=self._model,
+                    max_tokens=self.profile.max_tokens,
+                    temperature=self.profile.temperature,
+                    system=system_prompt,
+                    messages=messages,
+                ),
+                timeout=min(llm_timeout, remaining),
+            )
+        text = extract_text_content(resp.content).strip()
+        if not text:
+            raise RuntimeError(f"{self.agent_type.value} 无工具汇总没有返回内容")
+        return text
 
     @staticmethod
     def _block_type(block: Any) -> Optional[str]:
