@@ -471,7 +471,9 @@ def test_repeated_identical_tool_call_is_not_executed_again():
     assert "已经用相同参数调用过" in response.tool_traces[1]["error"]
 
 
-def test_second_repeated_call_stops_the_loop_as_no_progress():
+def test_second_repeated_call_stops_the_loop_as_no_progress(monkeypatch):
+    # 轮数足够时，第二次重复在最后一轮之前出现，走"无进展"停止；最后一轮另有无工具汇总兜底。
+    monkeypatch.setenv("ZHIYING_MAX_TOOL_ROUNDS", "5")
     executed = []
     client = _ScriptedClient(_tool_call("t1"), _tool_call("t2"), _tool_call("t3"))
     agent = GeneralAgent(client, "test-model")
@@ -531,3 +533,82 @@ def test_request_token_budget_stops_further_llm_rounds(monkeypatch):
     assert response.success is False
     assert "token 预算" in response.error
     assert len(calls) == 1
+
+
+class _RecordingClient:
+    """按顺序返回预设响应，并记录每次请求的参数。"""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls = []
+        owner = self
+
+        class Messages:
+            async def create(inner, **kwargs):
+                owner.calls.append(kwargs)
+                return owner.responses.pop(0)
+
+        self.messages = Messages()
+
+
+def test_final_round_forbids_tools_and_asks_for_an_answer():
+    executed = []
+    client = _RecordingClient(
+        _tool_call("t1", order_id="A1"),
+        _tool_call("t2", order_id="A2"),
+        _blocks({"type": "text", "text": "没有查到这两个订单，请核对订单号。"}),
+    )
+    agent = GeneralAgent(client, "test-model")
+    agent.set_domain_tools({"lookup_status": _counting_tool(executed)})
+
+    response = asyncio.run(agent.handle(make_request(intent=IntentCategory.QUERY, entities={})))
+
+    assert response.success is True
+    assert len(executed) == 2
+    assert [call.get("tool_choice") for call in client.calls] == [None, None, {"type": "none"}]
+    assert "本轮不能再调用工具" in client.calls[2]["system"]
+    assert "本轮不能再调用工具" not in client.calls[1]["system"]
+    # 工具定义仍然保留：历史里有 tool_use，去掉 tools 会被接口拒绝。
+    assert client.calls[2]["tools"]
+
+
+def test_single_round_still_forces_knowledge_search(monkeypatch):
+    monkeypatch.setenv("ZHIYING_MAX_TOOL_ROUNDS", "1")
+
+    class Rag:
+        async def search(self, tool_name, query, top_k=5, **policy):
+            return type("Result", (), {"success": True, "data": [], "reranked": False})()
+
+    client = _RecordingClient(_blocks({"type": "tool_use", "id": "t1", "name": "search_knowledge_base",
+                                       "input": {"query": "退款政策"}}))
+    agent = GeneralAgent(client, "test-model")
+    agent.set_shared_tools(build_shared_rag_tools(Rag()))
+
+    asyncio.run(agent.handle(make_request(message="退款政策是什么", intent=IntentCategory.REFUND, entities={})))
+
+    assert client.calls[0]["tool_choice"] == {"type": "tool", "name": "search_knowledge_base"}
+
+
+def test_final_round_tool_request_is_answered_without_tools():
+    """模型无视 tool_choice=none 仍请求工具时，不执行，改为不带工具地汇总已有结果。"""
+    executed = []
+    client = _RecordingClient(
+        _tool_call("t1", order_id="A1"),
+        _tool_call("t2", order_id="A2"),
+        _tool_call("t3", order_id="A3"),
+        _blocks({"type": "text", "text": "A1、A2 都已发货。"}),
+    )
+    agent = GeneralAgent(client, "test-model")
+    agent.set_domain_tools({"lookup_status": _counting_tool(executed)})
+
+    response = asyncio.run(agent.handle(make_request(message="A1 和 A2 发货了吗", intent=IntentCategory.QUERY, entities={})))
+
+    assert response.success is True
+    assert response.content == "A1、A2 都已发货。"
+    assert [args["order_id"] for args in executed] == ["A1", "A2"]
+    synthesis = client.calls[3]
+    assert "tools" not in synthesis and "tool_choice" not in synthesis
+    final_user = synthesis["messages"][-1]["content"]
+    assert final_user.startswith("A1 和 A2 发货了吗")
+    assert "lookup_status" in final_user and "已发货" in final_user
+    assert all(isinstance(m["content"], str) for m in synthesis["messages"])

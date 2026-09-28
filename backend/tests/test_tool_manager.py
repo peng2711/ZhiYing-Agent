@@ -102,7 +102,7 @@ def test_rerank_keeps_candidates_the_model_left_out():
     import types
 
     manager = ToolManager.__new__(ToolManager)
-    manager._model = "m"
+    manager._model = manager._rerank_model = "m"
 
     class Messages:
         async def create(self, **kwargs):

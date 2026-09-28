@@ -26,7 +26,7 @@ import chromadb
 import redis.asyncio as redis
 from core.llm_utils import extract_text_content
 from core.usage import llm_role
-from core.llm_client import create_llm_client
+from core.llm_client import create_llm_client, role_model
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ class MemoryManager:
         if base_url:
             kwargs["base_url"] = base_url
         self._client = create_llm_client(api_key=api_key, base_url=base_url)
-        self._model  = model
+        self._model  = role_model("memory", model)
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
         # 单进程内保护同一会话的追加/压缩顺序；多实例部署仍应使用 Redis 分布式锁。

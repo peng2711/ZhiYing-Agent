@@ -117,6 +117,31 @@ python -m evaluation.retrieval_evaluator --embedding bge-small-zh --modes vector
 
 切换 embedding 模型时，每个模型使用独立 collection。服务启动时若新 collection 为空、旧 collection 有数据，会自动迁移知识库、情景记忆和用户画像（重新计算向量，旧数据保留，改回 `ZHIYING_EMBEDDING_MODEL=default` 即可回滚）；也可以提前手动执行 `python -m tooling.migrate_embeddings --from default --to bge-small-zh`。Docker 镜像构建时会预置模型。
 
+### 模型分工实验
+
+不需要启动 Redis/ChromaDB 服务即可离线运行完整评测（意图、对话、业务闭环），业务库、任务状态和知识库都建在临时目录里：
+
+```bash
+cd backend
+python -m evaluation.run_eval --tag baseline --output report.json
+```
+
+各环节模型通过 `ZHIYING_<ROLE>_MODEL` 单独指定（见 `.env.example`）。一次对比实验（Judge 固定为 `deepseek-v4-pro`，与被测的千问不同系列，避免自我偏好）：
+
+| 指标 | A：全部 qwen3.7-plus | B：意图/改写/重排/记忆用 qwen3.7-flash |
+|---|---|---|
+| 意图准确率（120 条） | 0.925 | 0.933 |
+| 检索 Hit@1（按需重排） | 0.977 | 0.977 |
+| 对话综合分（42 轮） | 0.875 | 0.855 |
+| 未确认资金操作执行率 | 0 | 0 |
+| 平均每轮 token（线上链路） | 7014 | 7149 |
+
+- 对话综合分的逐轮配对差为 -0.020，95% 置信区间 [-0.065, 0.025]，差异不显著；两组各只跑一次，结论只看趋势。
+- 这四个轻任务只占线上输入 token 的约 8.5%（A 组约 28 万中的 2.4 万），其余都在 Agent 调用上。即使轻任务的模型免费，线上成本也最多降低约 10%；进一步降成本应从 Agent 的系统提示词、Skills、工具定义和上下文入手。
+- `.env.example` 采用 B 组作为推荐配置；代码默认值仍是 `LLM_MODEL`。
+
+这两组实验还暴露了一个与模型分工无关的问题：84 轮对话里有 4 次"工具调用超过最大轮数"，其中 1 次用户直接看到报错。修复后（最后一轮强制作答，模型无视 `tool_choice=none` 时改为不带工具的汇总请求），用同样配置重跑 42 轮：超过最大轮数 0 次、报错回复 0 次，无工具汇总触发 3 次；对话综合分 0.875 → 0.885（配对差 +0.010，95% 置信区间 [-0.013, 0.033]，不显著，说明修复没有伤害回答质量）。
+
 ## 设计演进、失败与取舍
 
 | 发现的问题 | 失败表现 | 改进 | 设计取舍 |
@@ -131,6 +156,7 @@ python -m evaluation.retrieval_evaluator --embedding bge-small-zh --modes vector
 | 本地跨端口请求未携带 Cookie | 访客身份可能逐轮变化，任务状态丢失 | Fetch 统一启用 `credentials: include` | CORS 必须使用明确来源并允许凭据 |
 | 知识库一直用 ChromaDB 默认 embedding | 默认模型以英文为主，中文口语查询 Hit@3 只有 0.33 | 新增检索评测，默认改用 bge-small-zh，启动时自动迁移旧数据 | 换模型要换 collection、重算向量；旧 collection 保留用于回滚 |
 | 每次检索都跑查询改写和 LLM 重排 | 改写没有收益却多 1.6 秒；重排提示词截断正文，易混淆问题变差 | 关闭改写，修复重排输入，只在前两名分数接近时重排 | 按需重排的阈值来自同一评测集，换数据需重新评估 |
+| 工具轮数用完即失败 | 最后一轮模型仍调用工具时，已获得的结果全部作废，84 轮评测中 4 次失败 | 最后一轮禁止调用工具；模型无视 `tool_choice=none`（qwen3.7-plus 实测会）时改为不带工具的汇总请求 | 厂商参数约束只作第一道防线，终止逻辑在自己的代码里兜底，最多多一次调用 |
 | 本地与容器 Chroma 默认值混用 | 数据可能写入意外目录 | 本地默认 `localhost:8001` 并回退仓库目录，Compose 显式使用 `chromadb:8000` | 服务模式和嵌入式模式保留同一接口 |
 
 ## 技术栈

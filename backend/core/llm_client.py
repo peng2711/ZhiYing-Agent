@@ -154,12 +154,14 @@ def anthropic_tools_to_openai(tools: Optional[Iterable[Dict[str, Any]]]) -> List
 def anthropic_tool_choice_to_openai(choice: Any) -> Any:
     if not isinstance(choice, dict):
         return choice
-    if choice.get("type") == "tool":
+    kind = choice.get("type")
+    if kind == "tool":
         return {
             "type": "function",
             "function": {"name": choice.get("name", "")},
         }
-    return choice
+    # Anthropic 的 auto / any / none 在 OpenAI 协议里是字符串 auto / required / none。
+    return {"auto": "auto", "any": "required", "none": "none"}.get(kind, choice)
 
 
 def openai_response_to_anthropic(response: Any) -> LLMMessageResponse:
@@ -257,6 +259,20 @@ class QwenClient(OpenAICompatibleClient):
 
 
 LLMClient = Any
+
+# 可以单独指定模型的环节。Agent 另有 ZHIYING_<AGENT>_MODEL（general/technical/billing/escalation）。
+MODEL_ROLES = ("intent", "rewrite", "rerank", "composer", "memory", "judge")
+
+
+def role_model(role: str, default: str) -> str:
+    """环节级模型覆盖：读取 ZHIYING_<ROLE>_MODEL，未配置时使用 default（通常是 LLM_MODEL）。
+
+    意图识别、改写、重排、记忆压缩这类轻任务可以换成更便宜的模型；Judge 应固定为
+    与被测模型不同系列的模型，避免自我偏好，并保证多次评测的分数可比。
+    """
+    if role not in MODEL_ROLES:
+        raise ValueError(f"未知的模型环节 {role!r}，可选: {', '.join(MODEL_ROLES)}")
+    return os.getenv(f"ZHIYING_{role.upper()}_MODEL", "").strip() or default
 
 
 class _MeteredMessages:

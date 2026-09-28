@@ -84,3 +84,14 @@ def test_qwen_uses_its_own_non_thinking_parameter(monkeypatch):
 
     assert captured["extra_body"] == {"enable_thinking": False}
     assert "thinking" not in captured["extra_body"]
+
+
+def test_tool_choice_modes_are_translated_to_openai_strings():
+    from core.llm_client import anthropic_tool_choice_to_openai
+
+    assert anthropic_tool_choice_to_openai({"type": "none"}) == "none"
+    assert anthropic_tool_choice_to_openai({"type": "auto"}) == "auto"
+    assert anthropic_tool_choice_to_openai({"type": "any"}) == "required"
+    assert anthropic_tool_choice_to_openai({"type": "tool", "name": "x"}) == {
+        "type": "function", "function": {"name": "x"},
+    }
