@@ -1,24 +1,8 @@
 import asyncio
-import hashlib
-
-from chromadb import Documents, EmbeddingFunction, Embeddings
 
 from evaluation import retrieval_evaluator as rev
+from tests_support_embedding import BigramHashEmbedding
 from tooling.embeddings import collection_name_for
-
-
-class BigramHashEmbedding(EmbeddingFunction[Documents]):
-    """确定性的字符二元组哈希向量，测试里替代需要下载的模型。"""
-
-    def __call__(self, input: Documents) -> Embeddings:
-        vectors = []
-        for text in input:
-            vec = [0.0] * 64
-            for i in range(len(text) - 1):
-                vec[int(hashlib.md5(text[i:i + 2].encode()).hexdigest(), 16) % 64] += 1.0
-            norm = sum(v * v for v in vec) ** 0.5 or 1.0
-            vectors.append([v / norm for v in vec])
-        return vectors
 
 
 def test_score_query_counts_documents_not_chunks():
@@ -81,3 +65,4 @@ def test_llm_modes_require_an_api_key(monkeypatch):
 def test_each_embedding_model_gets_its_own_collection():
     assert collection_name_for("default") == "knowledge_base"
     assert collection_name_for("bge-small-zh") == "knowledge_base__bge-small-zh"
+    assert collection_name_for("bge-small-zh", base="episodic") == "episodic__bge-small-zh"

@@ -40,6 +40,9 @@ def _llm_timeout_s() -> float:
 
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
 
+RERANK_SNIPPET_CHARS = 300
+
+
 class CircuitState(Enum):
     CLOSED    = "closed"     # 正常
     OPEN      = "open"       # 熔断，拒绝请求
@@ -363,54 +366,107 @@ class ToolManager:
         top_k: int = 5,
         context: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
-        """
-        完整的检索优化链路：查询改写 → 并行召回 → 去重 → 重排 → Top-K
+        """完整链路：查询改写 → 并行召回 → 去重 → 重排 → Top-K（/search 演示接口和评测使用）。"""
+        return await self.search(
+            tool_name, query, top_k=top_k, context=context,
+            rewrite=True, rerank="always", recall_k=max(top_k, 5),
+        )
 
-        这是解决"检索不全、召回不好"的完整方案。
+    async def search(
+        self,
+        tool_name: str,
+        query: str,
+        top_k: int = 5,
+        context: Optional[Dict[str, Any]] = None,
+        rewrite: bool = False,
+        rerank: str = "auto",
+        rerank_margin: float = 0.03,
+        recall_k: int = 10,
+    ) -> ToolResult:
         """
-        # 1. 查询改写：生成多角度子查询
-        sub_queries = await self.rewrite_query(query, n=3)
-        logger.info(f"查询改写: {query!r} → {sub_queries}")
+        可配置的检索链路：（可选）查询改写 → 召回 → 去重 → （按策略）重排 → Top-K。
 
-        # 2. 并行召回：所有子查询同时检索
-        recall_k = max(top_k, 5)
-        tasks = [
+        rerank 策略：
+          - always：总是用 LLM 重排
+          - auto：前两个不同文档的相似度差小于 rerank_margin 时才重排。检索评测里，
+            向量检索排错的查询绝大多数属于这种"分不开"的情况，分数拉开时重排几乎没有收益。
+          - never：只用向量分数
+        """
+        if rerank not in {"always", "auto", "never"}:
+            raise ValueError("rerank 只能是 always、auto 或 never")
+        sub_queries = await self.rewrite_query(query, n=3) if rewrite else [query]
+        if rewrite:
+            logger.info(f"查询改写: {query!r} → {sub_queries}")
+
+        recall_k = max(recall_k, top_k)
+        results = await asyncio.gather(*(
             self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
             for q in sub_queries
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        ), return_exceptions=True)
 
-        # 3. 合并去重。RAG 同一 chunk 在不同子查询下的 score 会变化，不能直接
-        # 对整个 dict 哈希，否则会把同一证据重复返回；重复时保留最高分结果。
-        seen: Dict[str, int] = {}
-        merged = []
-        for r in results:
-            if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
-                for item in r.data:
-                    if isinstance(item, dict) and item.get("source_id"):
-                        identity = {
-                            "source_id": item.get("source_id"),
-                            "version": item.get("version", "1.0"),
-                            "chunk": item.get("chunk", 0),
-                        }
-                    else:
-                        identity = item
-                    key = hashlib.md5(
-                        json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str).encode()
-                    ).hexdigest()
-                    if key not in seen:
-                        seen[key] = len(merged)
-                        merged.append(item)
-                    elif isinstance(item, dict) and isinstance(merged[seen[key]], dict):
-                        if float(item.get("score", 0) or 0) > float(merged[seen[key]].get("score", 0) or 0):
-                            merged[seen[key]] = item
-
+        merged = self._merge_results(results)
         if not merged:
-            return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无结果")
+            first = next((r for r in results if isinstance(r, ToolResult)), None)
+            return ToolResult(
+                success=False, data=[], tool_name=tool_name,
+                error=(first.error if first is not None and first.error else "所有子查询均无结果"),
+                fallback_used=bool(first and first.fallback_used),
+            )
 
-        # 4. 重排：用 LLM 对合并结果按相关性打分，取 Top-K
-        reranked = await self._rerank(query, merged, top_k)
+        fallback_used = any(isinstance(r, ToolResult) and r.fallback_used for r in results)
+        if fallback_used or not (rerank == "always" or (rerank == "auto" and self._scores_close(merged, rerank_margin))):
+            return ToolResult(success=True, data=merged[:top_k], tool_name=tool_name, fallback_used=fallback_used)
+
+        reranked = await self._rerank(query, merged[:recall_k], top_k)
         return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True)
+
+    @staticmethod
+    def _merge_results(results: List[Any]) -> List[Any]:
+        """合并多路召回并按分数降序排列。
+
+        同一 chunk 在不同子查询下的 score 会变化，不能直接对整个 dict 哈希，
+        否则会把同一证据重复返回；重复时保留最高分结果。
+        """
+        seen: Dict[str, int] = {}
+        merged: List[Any] = []
+        for r in results:
+            if not (isinstance(r, ToolResult) and r.success and isinstance(r.data, list)):
+                continue
+            for item in r.data:
+                if isinstance(item, dict) and item.get("source_id"):
+                    identity: Any = {
+                        "source_id": item.get("source_id"),
+                        "version": item.get("version", "1.0"),
+                        "chunk": item.get("chunk", 0),
+                    }
+                else:
+                    identity = item
+                key = hashlib.md5(
+                    json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str).encode()
+                ).hexdigest()
+                if key not in seen:
+                    seen[key] = len(merged)
+                    merged.append(item)
+                elif isinstance(item, dict) and isinstance(merged[seen[key]], dict):
+                    if float(item.get("score", 0) or 0) > float(merged[seen[key]].get("score", 0) or 0):
+                        merged[seen[key]] = item
+        return sorted(
+            merged,
+            key=lambda item: float(item.get("score", 0) or 0) if isinstance(item, dict) else 0.0,
+            reverse=True,
+        )
+
+    @staticmethod
+    def _scores_close(items: List[Any], margin: float) -> bool:
+        """前两个不同文档的最高分之差是否小于 margin；同一文档的多个 chunk 只算一次。"""
+        best: Dict[str, float] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source_id") or item.get("title") or id(item))
+            best.setdefault(source, float(item.get("score", 0) or 0))
+        top = sorted(best.values(), reverse=True)
+        return len(top) >= 2 and top[0] - top[1] < margin
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
@@ -421,19 +477,17 @@ class ToolManager:
         解决问题：向量检索的相似度分数不等于"对用户有用"，
         LLM 能理解语义相关性，重排后 Top-K 质量显著提升。
         """
-        if len(items) <= top_k:
-            return items
+        # 候选不超过 top_k 时也要重排：重排决定的不只是"留哪些"，还有第一名是谁。
+        if len(items) <= 1:
+            return items[:top_k]
 
-        # 将结果序列化为文本供 LLM 评分
-        items_text = "\n".join(f"{i}. {json.dumps(item, ensure_ascii=False)[:200]}"
-                               for i, item in enumerate(items))
-        prompt = f"""根据用户查询，对以下检索结果按相关性打分（0-10），返回 JSON 数组。
-用户查询: "{query}"
-检索结果:
+        items_text = "\n".join(f"{i}. {self._rerank_snippet(item)}" for i, item in enumerate(items))
+        prompt = f"""根据用户问题，把下面的候选文档按"能否回答这个问题"从高到低排序。
+用户问题: "{query}"
+候选文档（序号. 【标题】正文片段）:
 {items_text}
 
-返回格式（按相关性降序排列的索引列表）: [最相关的索引, ..., 最不相关的索引]
-只返回 JSON 数组，不要其他文字。"""
+只返回序号组成的 JSON 数组，最相关的在前，例如 [3, 0, 5]，不要其他文字。"""
         prompt = self._clean_text(prompt)
 
         try:
@@ -448,11 +502,28 @@ class ToolManager:
             raw = extract_text_content(resp.content)
             s, e = raw.find("["), raw.rfind("]") + 1
             order: List[int] = json.loads(raw[s:e])
-            reranked = [items[i] for i in order if 0 <= i < len(items)]
-            return reranked[:top_k]
+            # 模型可能只返回部分索引或重复索引：去重后，没排到的按原顺序补在后面。
+            ranked_idx = list(dict.fromkeys(i for i in order if isinstance(i, int) and 0 <= i < len(items)))
+            ranked_idx += [i for i in range(len(items)) if i not in ranked_idx]
+            return [items[i] for i in ranked_idx][:top_k]
         except Exception as ex:
             logger.warning(f"重排失败，返回原始顺序: {ex}")
             return items[:top_k]
+
+    @staticmethod
+    def _rerank_snippet(item: Any, max_chars: int = RERANK_SNIPPET_CHARS) -> str:
+        """给重排模型看的候选文本：标题 + 正文片段。
+
+        早期实现把整条结果序列化成 JSON 后截断到 200 字，元数据字段排在前面，
+        正文常被截掉，模型只能凭标题判断；标题相近的易混淆文档因此被排错。
+        """
+        if not isinstance(item, dict):
+            return str(item)[:max_chars]
+        title = str(item.get("title") or item.get("document_name") or "").strip()
+        content = " ".join(str(item.get("content") or "").split())
+        if len(content) > max_chars:
+            content = content[:max_chars] + "…"
+        return f"【{title}】{content}" if title else content
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 

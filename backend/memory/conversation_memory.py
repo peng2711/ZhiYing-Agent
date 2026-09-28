@@ -103,6 +103,7 @@ class MemoryManager:
         api_key:      str = "",
         base_url:     Optional[str] = None,
         model:        str = "claude-3-5-sonnet-20241022",
+        embedding_model: str = "default",
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -132,10 +133,25 @@ class MemoryManager:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
-        # 情景记忆：存储历史对话片段
-        self._episodic = chroma.get_or_create_collection("episodic")
-        # 用户画像：存储提炼出的偏好和实体
-        self._profile  = chroma.get_or_create_collection("user_profile")
+        # 情景记忆：存储历史对话片段；用户画像：存储提炼出的偏好和实体。
+        # 与知识库使用同一个 embedding 模型，切换模型时从旧 collection 迁移。
+        self._episodic = self._open_collection(chroma, "episodic", embedding_model)
+        self._profile  = self._open_collection(chroma, "user_profile", embedding_model)
+
+    @staticmethod
+    def _open_collection(chroma: Any, base: str, embedding_model: str) -> Any:
+        from tooling.embeddings import (
+            collection_name_for, embedding_cache_dir, get_embedding_function, legacy_collection_for,
+        )
+        from tooling.migrate_embeddings import migrate_collection
+
+        embedding_function = get_embedding_function(embedding_model, embedding_cache_dir())
+        kwargs = {"embedding_function": embedding_function} if embedding_function is not None else {}
+        collection = chroma.get_or_create_collection(collection_name_for(embedding_model, base), **kwargs)
+        legacy = legacy_collection_for(embedding_model, base)
+        if legacy:
+            migrate_collection(chroma, legacy, collection)
+        return collection
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
 

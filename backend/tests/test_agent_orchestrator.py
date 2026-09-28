@@ -137,7 +137,7 @@ def test_agent_tool_scopes_are_real_and_isolated():
 
 def test_shared_rag_tool_is_available_to_all_agents():
     class RagManager:
-        async def search_with_rewrite(self, tool_name, query, top_k=5):
+        async def search(self, tool_name, query, top_k=5, **policy):
             return type(
                 "Result",
                 (),
@@ -237,7 +237,7 @@ def test_rag_results_are_exposed_as_structured_citations():
         @property
         def messages(self): return self.Messages(self)
     class RagManager:
-        async def search_with_rewrite(self, tool_name, query, top_k=5):
+        async def search(self, tool_name, query, top_k=5, **policy):
             data = [{"source_id": "refund-policy", "document_name": "退款政策", "version": "3.0",
                      "updated_at": "2026-08-20", "section": "退款时限", "chunk": 2,
                      "content": "购买后 7 天内可以申请无理由退款。", "score": 0.93}]
