@@ -30,6 +30,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 
 import chromadb
 
+from core.usage import track_request_usage
 from tooling.embeddings import SUPPORTED_EMBEDDINGS, collection_name_for, get_embedding_function
 from tooling.knowledge_base import KnowledgeBase
 
@@ -117,6 +118,19 @@ async def evaluate(searcher: Searcher, cases: List[Dict[str, Any]], concurrency:
     return report
 
 
+class _FallbackCounter(logging.Handler):
+    """改写和重排失败时会静默退回原始结果，只打 warning；评测必须把这些次数单独报出来，
+    否则"LLM 调用失败"会被误读成"改写/重排没有效果"。"""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.count = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if "失败" in record.getMessage():
+            self.count += 1
+
+
 def build_knowledge_base(
     embedding: str, documents: List[Dict[str, Any]], workdir: str, cache_dir: Optional[str] = None,
 ) -> KnowledgeBase:
@@ -200,19 +214,34 @@ async def run(embeddings: Sequence[str], modes: Sequence[str], top_k: int, cache
             kb = build_knowledge_base(embedding, documents, workdir, cache_dir=cache_dir)
             index_s = round(time.monotonic() - t0, 1)
             for mode, searcher in build_searchers(kb, modes, top_k).items():
-                result = await evaluate(searcher, cases, concurrency=1 if mode == "vector" else 4)
+                counter = _FallbackCounter()
+                tool_logger = logging.getLogger("tooling.tool_manager")
+                tool_logger.addHandler(counter)
+                try:
+                    with track_request_usage() as usage:
+                        result = await evaluate(searcher, cases, concurrency=1 if mode == "vector" else 4)
+                finally:
+                    tool_logger.removeHandler(counter)
+                spent = usage.summary()
+                result["llm_fallbacks"] = counter.count
+                result["llm_calls"] = spent["llm_calls"]
+                result["tokens_per_query"] = round(
+                    (spent["input_tokens"] + spent["output_tokens"]) / max(len(cases), 1), 1,
+                )
                 report["runs"].append({"embedding": embedding, "mode": mode, "index_seconds": index_s, **result})
     return report
 
 
 def format_table(report: Dict[str, Any]) -> str:
-    header = f"{'embedding':<14}{'mode':<16}{'Hit@1':>7}{'Hit@3':>7}{'Hit@5':>7}{'Recall@5':>10}{'MRR':>7}{'p50 ms':>9}"
+    header = (f"{'embedding':<14}{'mode':<16}{'Hit@1':>7}{'Hit@3':>7}{'Hit@5':>7}{'Recall@5':>10}{'MRR':>7}"
+              f"{'p50 ms':>9}{'tok/q':>8}{'fallback':>10}")
     lines = [header, "-" * len(header)]
     for r in report["runs"]:
         o = r["overall"]
         lines.append(
             f"{r['embedding']:<14}{r['mode']:<16}{o['hit@1']:>7.3f}{o['hit@3']:>7.3f}{o['hit@5']:>7.3f}"
             f"{o['recall@5']:>10.3f}{o['mrr']:>7.3f}{r['latency_ms_p50']:>9.1f}"
+            f"{r.get('tokens_per_query', 0):>8.0f}{r.get('llm_fallbacks', 0):>10}"
         )
     return "\n".join(lines)
 
