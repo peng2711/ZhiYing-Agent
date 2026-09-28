@@ -42,6 +42,7 @@ class KnowledgeBase:
         collection_name: Optional[str] = None,
         load_default_docs: bool = True,
         client: Any = None,
+        migrate_from_collection: Optional[str] = None,
     ):
         # 优先连接独立 ChromaDB 服务，不可用时退回本地持久化目录。
         # 两种模式下 embedding 都在本进程计算（Dockerfile 因此预置了模型缓存）。
@@ -62,6 +63,10 @@ class KnowledgeBase:
             metadata={"description": "ZhiYing Agent RAG 知识库", "hnsw:space": "cosine"},
             **kwargs,
         )
+        # 切换 embedding 模型后新 collection 为空：先从旧 collection 迁移，避免只剩演示文档。
+        if migrate_from_collection:
+            from tooling.migrate_embeddings import migrate_collection
+            migrate_collection(self._client, migrate_from_collection, self._collection)
         # 已存在的 collection 不会因为传入 hnsw:space 而改变索引，按实际距离类型换算分数。
         self._distance_space = (self._collection.metadata or {}).get("hnsw:space", "l2")
         if self._distance_space != "cosine":

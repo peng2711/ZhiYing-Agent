@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 
 from core.intent_recognizer import IntentCategory, intent_group_for
 from core.usage import current_request_usage, track_request_usage
+from tooling.embeddings import configured_embedding
 
 load_dotenv()
 
@@ -101,8 +102,11 @@ async def lifespan(app: FastAPI):
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
 
+    from tooling.embeddings import collection_name_for, configured_embedding_function, legacy_collection_for
+
     cfg = _llm_cfg()
     chroma_cfg = _chroma_cfg()
+    embedding_model = configured_embedding()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
 
     # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
@@ -137,6 +141,7 @@ async def lifespan(app: FastAPI):
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
+        embedding_model=configured_embedding(),
     )
 
     _business_backend = MockBusinessBackend(
@@ -151,16 +156,13 @@ async def lifespan(app: FastAPI):
         base_url=cfg.get("base_url"),
         model=cfg["model"],
     )
-    from tooling.embeddings import collection_name_for, get_embedding_function
-    embedding_model = os.getenv("ZHIYING_EMBEDDING_MODEL", "default").strip() or "default"
     kb = KnowledgeBase(
         chroma_host=chroma_cfg["host"],
         chroma_port=chroma_cfg["port"],
         chroma_path=chroma_cfg["path"],
-        embedding_function=get_embedding_function(
-            embedding_model, cache_dir=os.getenv("ZHIYING_EMBEDDING_CACHE_DIR") or None,
-        ),
+        embedding_function=configured_embedding_function(),
         collection_name=collection_name_for(embedding_model),
+        migrate_from_collection=legacy_collection_for(embedding_model),
     )
     logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段（embedding={embedding_model}）")
 
@@ -964,6 +966,7 @@ async def _cli():
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
+        embedding_model=configured_embedding(),
     )
 
     user_id, conv_id = "cli_user", str(uuid.uuid4())

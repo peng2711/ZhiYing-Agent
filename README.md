@@ -93,33 +93,29 @@ flowchart LR
 cd backend
 python -m evaluation.retrieval_evaluator --embedding default bge-small-zh
 # 需要 LLM 配置时可继续对比查询改写和重排的贡献
-python -m evaluation.retrieval_evaluator --embedding bge-small-zh --modes vector rewrite rerank rewrite+rerank
+python -m evaluation.retrieval_evaluator --embedding bge-small-zh --modes vector rewrite rerank auto-rerank rewrite+rerank
 ```
 
-在这套自建数据上纯向量检索的一次运行结果如下。数据集由同一作者编写，绝对值可能偏乐观，应主要看两个模型之间的差距：
-
-| embedding | Hit@1 | Hit@3 | MRR |
-|---|---|---|---|
-| ChromaDB 默认（all-MiniLM-L6-v2） | 0.172 | 0.333 | 0.288 |
-| bge-small-zh-v1.5 | 0.885 | 0.977 | 0.927 |
-
-默认模型只在含 `401`、`502` 等字面词的查询上有效，口语化中文查询的 Hit@1 只有 0.07。通过 `ZHIYING_EMBEDDING_MODEL=bge-small-zh` 切换（独立 collection，切换后需重新导入知识库）。
-
-同一数据集上各环节的贡献（LLM 为 `qwen3.7-plus`，431 次调用中 1 次失败退回）：
+结果（LLM 为 `qwen3.7-plus`；数据集由同一作者编写，绝对值可能偏乐观，应主要看各行之间的差距）：
 
 | embedding | 模式 | Hit@1 | Hit@3 | MRR | p50 耗时 | token/查询 |
 |---|---|---|---|---|---|---|
+| 默认（all-MiniLM-L6-v2） | 纯向量 | 0.172 | 0.333 | 0.288 | 12 ms | 0 |
+| 默认（all-MiniLM-L6-v2） | + LLM 重排（旧提示词） | 0.713 | 0.724 | 0.721 | 2.3 s | 1846 |
 | bge-small-zh | 纯向量 | 0.885 | 0.977 | 0.927 | 5 ms | 0 |
 | bge-small-zh | + 查询改写 | 0.897 | 0.966 | 0.936 | 1.6 s | 116 |
-| bge-small-zh | + LLM 重排 | 0.931 | 0.977 | 0.954 | 2.4 s | 1861 |
-| bge-small-zh | 改写 + 重排（线上链路） | 0.931 | 0.989 | 0.958 | 2.9 s | 954 |
-| 默认 | 纯向量 | 0.172 | 0.333 | 0.288 | 12 ms | 0 |
-| 默认 | + LLM 重排 | 0.713 | 0.724 | 0.721 | 2.3 s | 1846 |
+| bge-small-zh | + LLM 重排（旧提示词，20 个候选） | 0.931 | 0.977 | 0.954 | 2.4 s | 1861 |
+| bge-small-zh | + LLM 重排（新提示词，10 个候选） | 0.989 | 0.989 | 0.989 | 1.6 s | 813 |
+| bge-small-zh | **按需重排（默认，25% 的查询触发）** | **0.977** | **0.989** | **0.983** | 5 ms | **211** |
+| bge-small-zh | 改写 + 重排（新提示词） | 0.989 | 0.989 | 0.989 | 2.7 s | 585 |
 
-- embedding 是决定性因素：bge-small-zh 纯向量（0 token、5 ms）明显好于默认模型加重排。重排只能调整已召回候选的顺序，召回不到的文档救不回来，所以默认模型加重排后 Hit@3 仍只有 0.72。
-- 换成 bge-small-zh 后，查询改写几乎没有收益（Hit@3 反而下降 0.011），却让每次检索多花约 1.6 秒。
-- LLM 重排把 Hit@1 提高了 4.6 个百分点，但易混淆类查询的 Hit@1 从 1.00 降到 0.77。可能的原因是重排提示词把每条结果序列化成 JSON 后只截取前 200 字，元数据排在前面，正文被截掉了。
-- 改写 + 重排的 token 比单独重排少，是因为这条链路每个子查询只召回 5 条，重排的候选更少。
+由此确定的默认配置：
+
+- **embedding 默认使用 bge-small-zh。** 默认模型只在含 `401`、`502` 等字面词的查询上有效，口语化中文查询的 Hit@1 只有 0.07；重排只能调整已召回候选的顺序，救不回没召回的文档。
+- **查询改写默认关闭。** 换成 bge-small-zh 后它没有额外收益，却让每次检索多花约 1.6 秒。
+- **LLM 重排按需触发。** 旧提示词把每条结果序列化成 JSON 后只截取前 200 字，元数据在前，正文常被截掉，易混淆类查询的 Hit@1 因此从 1.00 降到 0.77；改为"标题 + 正文片段"后恢复到 1.00（同时候选数由 20 降到 10）。向量检索排错的查询里，9/10 的前两名分数差小于 0.03，因此只在这种情况下重排：约 1/4 的查询触发，效果接近全量重排，token 约为全量重排的 1/4。阈值是在同一评测集上选的，更换知识库后应重新评估（`--rerank-margin`）。
+
+切换 embedding 模型时，每个模型使用独立 collection。服务启动时若新 collection 为空、旧 collection 有数据，会自动迁移知识库、情景记忆和用户画像（重新计算向量，旧数据保留，改回 `ZHIYING_EMBEDDING_MODEL=default` 即可回滚）；也可以提前手动执行 `python -m tooling.migrate_embeddings --from default --to bge-small-zh`。Docker 镜像构建时会预置模型。
 
 ## 设计演进、失败与取舍
 
@@ -133,7 +129,8 @@ python -m evaluation.retrieval_evaluator --embedding bge-small-zh --modes vector
 | 升级只生成一句摘要 | 用户无法获得可追踪处理编号 | 创建持久化工单并返回状态 | 当前不连接真实客服排班系统 |
 | RAG 只把文本塞回模型 | 用户看不到答案依据 | 返回文档、版本、章节、更新时间和 chunk | 引用元数据由服务端生成，避免模型编造来源 |
 | 本地跨端口请求未携带 Cookie | 访客身份可能逐轮变化，任务状态丢失 | Fetch 统一启用 `credentials: include` | CORS 必须使用明确来源并允许凭据 |
-| 知识库一直用 ChromaDB 默认 embedding | 默认模型以英文为主，中文口语查询 Hit@3 只有 0.33 | 新增检索评测集和 Hit@K/MRR 评测，支持 bge-small-zh | 换模型要换 collection 并重新导入，因此做成配置项而不是静默切换 |
+| 知识库一直用 ChromaDB 默认 embedding | 默认模型以英文为主，中文口语查询 Hit@3 只有 0.33 | 新增检索评测，默认改用 bge-small-zh，启动时自动迁移旧数据 | 换模型要换 collection、重算向量；旧 collection 保留用于回滚 |
+| 每次检索都跑查询改写和 LLM 重排 | 改写没有收益却多 1.6 秒；重排提示词截断正文，易混淆问题变差 | 关闭改写，修复重排输入，只在前两名分数接近时重排 | 按需重排的阈值来自同一评测集，换数据需重新评估 |
 | 本地与容器 Chroma 默认值混用 | 数据可能写入意外目录 | 本地默认 `localhost:8001` 并回退仓库目录，Compose 显式使用 `chromadb:8000` | 服务模式和嵌入式模式保留同一接口 |
 
 ## 技术栈
