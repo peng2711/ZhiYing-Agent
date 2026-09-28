@@ -41,6 +41,7 @@ from agents.tools import (
     technical_tools,
 )
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel, intent_group_for
+from core.usage import current_request_usage, llm_role
 from core.llm_utils import extract_text_content
 from core.llm_client import LLMClient, create_llm_client
 from core.task_intent import TaskIntentTracker
@@ -339,10 +340,11 @@ class BaseAgent:
                         "type": "tool",
                         "name": "search_knowledge_base",
                     }
-            resp = await asyncio.wait_for(
-                self._client.messages.create(**request_kwargs),
-                timeout=llm_timeout,
-            )
+            with llm_role(f"agent:{self.agent_type.value}"):
+                resp = await asyncio.wait_for(
+                    self._client.messages.create(**request_kwargs),
+                    timeout=llm_timeout,
+                )
             tool_uses = [block for block in (resp.content or []) if self._block_type(block) == "tool_use"]
             if not tool_uses:
                 if rag_required and round_idx == 0:
@@ -743,12 +745,13 @@ class ResponseComposer:
             if skill:
                 prompt += f"\n\n[通用客服输出边界]\n{skill}"
         try:
-            response = await self._client.messages.create(
-                model=self._model,
-                max_tokens=_env_int("ZHIYING_COMPOSER_MAX_TOKENS", 1000),
-                temperature=_env_float("ZHIYING_COMPOSER_TEMPERATURE", 0.1),
-                messages=[{"role": "user", "content": prompt}],
-            )
+            with llm_role("composer"):
+                response = await self._client.messages.create(
+                    model=self._model,
+                    max_tokens=_env_int("ZHIYING_COMPOSER_MAX_TOKENS", 1000),
+                    temperature=_env_float("ZHIYING_COMPOSER_TEMPERATURE", 0.1),
+                    messages=[{"role": "user", "content": prompt}],
+                )
             content = extract_text_content(response.content).strip()
             if content:
                 return content
@@ -923,7 +926,17 @@ class AgentOrchestrator:
             "ticket_id": result.ticket.get("ticket_id") if result.ticket else None,
             "latency_ms": round(result.latency_ms, 1),
         }
+        usage = current_request_usage()
+        if usage is not None:
+            trace["token_usage"] = usage.summary()
         self._recent_tool_traces.append(trace)
+
+    def annotate_trace(self, request_id: str, **fields: Any) -> None:
+        """补充编排结束后才产生的信息，例如写记忆时的压缩调用也计入 token 用量。"""
+        for trace in reversed(self._recent_tool_traces):
+            if trace.get("request_id") == request_id:
+                trace.update(fields)
+                return
 
     def get_tool_trace(self, request_id: str) -> Optional[Dict[str, Any]]:
         for trace in reversed(self._recent_tool_traces):

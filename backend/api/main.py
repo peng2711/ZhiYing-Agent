@@ -29,6 +29,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 from core.intent_recognizer import IntentCategory, intent_group_for
+from core.usage import current_request_usage, track_request_usage
 
 load_dotenv()
 
@@ -380,6 +381,7 @@ class ChatResponse(BaseModel):
     pending_action: Optional[Dict[str, Any]] = None
     ticket: Optional[Dict[str, Any]] = None
     task_state: Dict[str, Any] = Field(default_factory=dict)
+    token_usage: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolTraceResponse(BaseModel):
@@ -431,6 +433,12 @@ async def chat(req: ChatRequest, response: Response, request: FastAPIRequest):
     主对话接口。完整流程：
       记忆读取 → 意图识别 → Agent 路由 → 执行 → 记忆写入
     """
+    # 统计本次请求内所有 LLM 调用（意图、Agent、改写、重排、记忆压缩）的 token 用量。
+    with track_request_usage():
+        return await _chat(req, response, request)
+
+
+async def _chat(req: ChatRequest, response: Response, request: FastAPIRequest) -> ChatResponse:
     if _orchestrator is None or _memory is None:
         raise HTTPException(503, "服务未就绪")
 
@@ -505,9 +513,13 @@ async def chat(req: ChatRequest, response: Response, request: FastAPIRequest):
         persist_long_term=persist_long_term,
     )
 
-    # 5. 异步更新用户画像（不阻塞响应）
+    # 5. 异步更新用户画像（不阻塞响应）；它的用量只计入 Prometheus，不计入本次响应。
     if persist_long_term:
         asyncio.create_task(_memory.update_profile(memory_user_id, conv_id))
+
+    usage = current_request_usage()
+    token_usage = usage.summary() if usage is not None else {}
+    _orchestrator.annotate_trace(result.request_id, token_usage=token_usage)
 
     return ChatResponse(
         conv_id=conv_id,
@@ -533,6 +545,7 @@ async def chat(req: ChatRequest, response: Response, request: FastAPIRequest):
         pending_action=result.pending_action,
         ticket=result.ticket,
         task_state=result.task_state,
+        token_usage=token_usage,
     )
 
 

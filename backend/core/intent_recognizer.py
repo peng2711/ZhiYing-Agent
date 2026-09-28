@@ -22,6 +22,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from core.llm_utils import extract_text_content
+from core.usage import llm_role
 from core.llm_client import LLMClient, create_llm_client
 
 logger = logging.getLogger(__name__)
@@ -302,15 +303,16 @@ class IntentRecognizer:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await asyncio.wait_for(
-                self.client.messages.create(
-                    model=self.model,
-                    max_tokens=256,
-                    temperature=0.1,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=self._llm_timeout_s(),
-            )
+            with llm_role("intent"):
+                resp = await asyncio.wait_for(
+                    self.client.messages.create(
+                        model=self.model,
+                        max_tokens=256,
+                        temperature=0.1,
+                        messages=[{"role": "user", "content": prompt}],
+                    ),
+                    timeout=self._llm_timeout_s(),
+                )
             raw = extract_text_content(resp.content)
             s, e = raw.find("{"), raw.rfind("}") + 1
             data = json.loads(raw[s:e])

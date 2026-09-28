@@ -25,6 +25,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.llm_utils import extract_text_content
+from core.usage import llm_role
 from core.llm_client import create_llm_client
 
 logger = logging.getLogger(__name__)
@@ -338,13 +339,14 @@ class ToolManager:
 返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
         prompt = self._clean_text(prompt)
         try:
-            resp = await asyncio.wait_for(
-                self._client.messages.create(
-                    model=self._model, max_tokens=256, temperature=0.3,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=_llm_timeout_s(),
-            )
+            with llm_role("query_rewrite"):
+                resp = await asyncio.wait_for(
+                    self._client.messages.create(
+                        model=self._model, max_tokens=256, temperature=0.3,
+                        messages=[{"role": "user", "content": prompt}],
+                    ),
+                    timeout=_llm_timeout_s(),
+                )
             raw = extract_text_content(resp.content)
             s, e = raw.find("["), raw.rfind("]") + 1
             queries = json.loads(raw[s:e])
@@ -435,13 +437,14 @@ class ToolManager:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await asyncio.wait_for(
-                self._client.messages.create(
-                    model=self._model, max_tokens=256, temperature=0.0,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=_llm_timeout_s(),
-            )
+            with llm_role("rerank"):
+                resp = await asyncio.wait_for(
+                    self._client.messages.create(
+                        model=self._model, max_tokens=256, temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}],
+                    ),
+                    timeout=_llm_timeout_s(),
+                )
             raw = extract_text_content(resp.content)
             s, e = raw.find("["), raw.rfind("]") + 1
             order: List[int] = json.loads(raw[s:e])

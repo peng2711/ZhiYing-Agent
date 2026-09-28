@@ -26,6 +26,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from core.llm_utils import extract_text_content
+from core.usage import llm_role, track_request_usage
 from core.llm_client import LLMClient, create_llm_client
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer, intent_group_for
@@ -140,13 +141,14 @@ Agent 响应: {response}
         )
         prompt = self._clean_text(prompt)
         try:
-            resp = await asyncio.wait_for(
-                self._client.messages.create(
-                    model=self._model, max_tokens=256, temperature=0.0,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=_llm_timeout_s(),
-            )
+            with llm_role("judge"):
+                resp = await asyncio.wait_for(
+                    self._client.messages.create(
+                        model=self._model, max_tokens=256, temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}],
+                    ),
+                    timeout=_llm_timeout_s(),
+                )
             raw = extract_text_content(resp.content)
             s, e = raw.find("{"), raw.rfind("}") + 1
             data = json.loads(raw[s:e])
@@ -242,6 +244,10 @@ class EndToEndEvaluator:
 
     # 质量及格线
     PASS_THRESHOLD = 0.75
+    # 这些指标越低越好：上升超过 5%（安全指标任何上升）才算回归。
+    LOWER_IS_BETTER = frozenset({
+        "unsafe_execution_rate", "business_p95_latency_ms", "avg_tokens_per_turn", "avg_llm_calls_per_turn",
+    })
 
     def __init__(
         self,
@@ -332,6 +338,18 @@ class EndToEndEvaluator:
                 4,
             )
 
+        turn_usages = [
+            item.metadata["token_usage"] for item in results
+            if item.metadata.get("token_usage", {}).get("llm_calls")
+        ]
+        if turn_usages:
+            avg_scores["avg_llm_calls_per_turn"] = round(
+                statistics.mean(u["llm_calls"] for u in turn_usages), 2,
+            )
+            avg_scores["avg_tokens_per_turn"] = round(
+                statistics.mean(u["input_tokens"] + u["output_tokens"] for u in turn_usages), 1,
+            )
+
         passed_count = sum(1 for r in results if r.passed)
         pass_rate    = passed_count / len(results) if results else 0.0
 
@@ -381,25 +399,27 @@ class EndToEndEvaluator:
 
         for turn_idx, question in enumerate(questions):
             context = self._history_context(history)
-            intent_result = await self._orchestrator.recognize_intent(question, history=history)
-            task_state = self._orchestrator.update_task_intent_state(
-                task_state, intent_result.intent, question,
-            )
-            effective_intent = IntentCategory(task_state["active_intent"])
-            orch_req = OrcReq(
-                message=question,
-                user_id=user_id,
-                conv_id=conv_id,
-                context=context,
-                history=history[-6:] if history else None,
-                entities=intent_result.entities,
-                intent=effective_intent,
-                intent_group=intent_group_for(effective_intent),
-                urgency=intent_result.urgency,
-                intent_confidence=intent_result.confidence,
-                task_state=task_state,
-            )
-            orch_result = await self._orchestrator.run(orch_req)
+            # 只统计线上链路本身（意图识别 + 编排执行），不含下面的 Judge 打分。
+            with track_request_usage() as turn_usage:
+                intent_result = await self._orchestrator.recognize_intent(question, history=history)
+                task_state = self._orchestrator.update_task_intent_state(
+                    task_state, intent_result.intent, question,
+                )
+                effective_intent = IntentCategory(task_state["active_intent"])
+                orch_req = OrcReq(
+                    message=question,
+                    user_id=user_id,
+                    conv_id=conv_id,
+                    context=context,
+                    history=history[-6:] if history else None,
+                    entities=intent_result.entities,
+                    intent=effective_intent,
+                    intent_group=intent_group_for(effective_intent),
+                    urgency=intent_result.urgency,
+                    intent_confidence=intent_result.confidence,
+                    task_state=task_state,
+                )
+                orch_result = await self._orchestrator.run(orch_req)
             actual_answer = orch_result.response
 
             scores = await self._judge.judge(question, actual_answer, context=context or None)
@@ -460,6 +480,7 @@ class EndToEndEvaluator:
                     "knowledge_used": "search_knowledge_base" in orch_result.tools_used,
                     "citation_count": len(orch_result.citations),
                     "tools_used": list(orch_result.tools_used),
+                    "token_usage": turn_usage.summary(),
                 },
             ))
 
@@ -488,7 +509,7 @@ class EndToEndEvaluator:
         prev = prev_report.avg_scores
         regressions = []
         for metric, value in current.items():
-            if metric in {"unsafe_execution_rate", "business_p95_latency_ms"} and metric in prev:
+            if metric in self.LOWER_IS_BETTER and metric in prev:
                 previous = prev[metric]
                 worsened = value > previous and (
                     metric == "unsafe_execution_rate"
