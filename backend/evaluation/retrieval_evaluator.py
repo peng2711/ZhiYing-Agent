@@ -9,9 +9,10 @@
 检索模式，用来拆开看每个环节的贡献：
   - vector：纯向量检索
   - rewrite：LLM 查询改写 → 多路召回 → 按最高分合并
-  - rerank：向量召回 20 条 → LLM 重排
-  - rewrite+rerank：线上 search_with_rewrite 的完整链路
-后三种需要 LLM（读取与服务相同的 LLM_API_KEY / LLM_MODEL / LLM_BASE_URL 配置）。
+  - rerank：向量召回 10 条 → 全部交给 LLM 重排
+  - auto-rerank：向量召回 10 条，前两个文档分数接近时才重排（Agent 检索工具的默认策略）
+  - rewrite+rerank：search_with_rewrite 的完整链路（改写 + 每个子查询召回 5 条 + 重排）
+后四种需要 LLM（读取与服务相同的 LLM_API_KEY / LLM_MODEL / LLM_BASE_URL 配置）。
 
 用法：
   python -m evaluation.retrieval_evaluator --embedding default bge-small-zh
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 DATASET_DIR = pathlib.Path(__file__).resolve().parent / "datasets"
 KS = (1, 3, 5)
 MRR_DEPTH = 10
-LLM_MODES = ("rewrite", "rerank", "rewrite+rerank")
+LLM_MODES = ("rewrite", "rerank", "auto-rerank", "rewrite+rerank")
 MODES = ("vector", *LLM_MODES)
 
 Searcher = Callable[[str], Awaitable[List[Dict[str, Any]]]]
@@ -147,7 +148,9 @@ def build_knowledge_base(
     return kb
 
 
-def build_searchers(kb: KnowledgeBase, modes: Sequence[str], top_k: int) -> Dict[str, Searcher]:
+def build_searchers(
+    kb: KnowledgeBase, modes: Sequence[str], top_k: int, rerank_margin: float = 0.03,
+) -> Dict[str, Searcher]:
     searchers: Dict[str, Searcher] = {}
     if "vector" in modes:
         async def vector(query: str) -> List[Dict[str, Any]]:
@@ -187,11 +190,21 @@ def build_searchers(kb: KnowledgeBase, modes: Sequence[str], top_k: int) -> Dict
             return sorted(best.values(), key=lambda item: item["score"], reverse=True)
         searchers["rewrite"] = rewrite
 
+    def policy_searcher(policy: str) -> Searcher:
+        async def search(query: str) -> List[Dict[str, Any]]:
+            result = await manager.search(
+                "knowledge_search", query, top_k=MRR_DEPTH, recall_k=MRR_DEPTH,
+                rewrite=False, rerank=policy, rerank_margin=rerank_margin,
+            )
+            search.reranked += int(result.reranked)
+            return result.data if result.success else []
+        search.reranked = 0
+        return search
+
     if "rerank" in modes:
-        async def rerank(query: str) -> List[Dict[str, Any]]:
-            candidates = await kb.search_async(query, top_k=20)
-            return await manager._rerank(query, candidates, top_k)
-        searchers["rerank"] = rerank
+        searchers["rerank"] = policy_searcher("always")
+    if "auto-rerank" in modes:
+        searchers["auto-rerank"] = policy_searcher("auto")
 
     if "rewrite+rerank" in modes:
         async def full(query: str) -> List[Dict[str, Any]]:
@@ -202,7 +215,10 @@ def build_searchers(kb: KnowledgeBase, modes: Sequence[str], top_k: int) -> Dict
     return searchers
 
 
-async def run(embeddings: Sequence[str], modes: Sequence[str], top_k: int, cache_dir: Optional[str]) -> Dict[str, Any]:
+async def run(
+    embeddings: Sequence[str], modes: Sequence[str], top_k: int, cache_dir: Optional[str],
+    rerank_margin: float = 0.03,
+) -> Dict[str, Any]:
     documents, cases = load_dataset()
     report: Dict[str, Any] = {
         "dataset": {"documents": len(documents), "queries": len(cases)},
@@ -213,7 +229,7 @@ async def run(embeddings: Sequence[str], modes: Sequence[str], top_k: int, cache
             t0 = time.monotonic()
             kb = build_knowledge_base(embedding, documents, workdir, cache_dir=cache_dir)
             index_s = round(time.monotonic() - t0, 1)
-            for mode, searcher in build_searchers(kb, modes, top_k).items():
+            for mode, searcher in build_searchers(kb, modes, top_k, rerank_margin).items():
                 counter = _FallbackCounter()
                 tool_logger = logging.getLogger("tooling.tool_manager")
                 tool_logger.addHandler(counter)
@@ -223,6 +239,8 @@ async def run(embeddings: Sequence[str], modes: Sequence[str], top_k: int, cache
                 finally:
                     tool_logger.removeHandler(counter)
                 spent = usage.summary()
+                if hasattr(searcher, "reranked"):
+                    result["rerank_rate"] = round(searcher.reranked / max(len(cases), 1), 3)
                 result["llm_fallbacks"] = counter.count
                 result["llm_calls"] = spent["llm_calls"]
                 result["tokens_per_query"] = round(
@@ -242,6 +260,7 @@ def format_table(report: Dict[str, Any]) -> str:
             f"{r['embedding']:<14}{r['mode']:<16}{o['hit@1']:>7.3f}{o['hit@3']:>7.3f}{o['hit@5']:>7.3f}"
             f"{o['recall@5']:>10.3f}{o['mrr']:>7.3f}{r['latency_ms_p50']:>9.1f}"
             f"{r.get('tokens_per_query', 0):>8.0f}{r.get('llm_fallbacks', 0):>10}"
+            + (f"   rerank {r['rerank_rate']:.0%}" if "rerank_rate" in r else "")
         )
     return "\n".join(lines)
 
@@ -251,6 +270,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--embedding", nargs="+", default=["default"], choices=SUPPORTED_EMBEDDINGS)
     parser.add_argument("--modes", nargs="+", default=["vector"], choices=MODES)
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--rerank-margin", type=float, default=0.03, help="auto-rerank 的触发阈值")
     parser.add_argument("--cache-dir", default=os.getenv("ZHIYING_EMBEDDING_CACHE_DIR") or None)
     parser.add_argument("--output", help="把完整报告（含每类指标和未命中查询）写入 JSON 文件")
     args = parser.parse_args(argv)
@@ -262,7 +282,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     logging.basicConfig(level=logging.WARNING)
     # chromadb 0.5 与新版 posthog 不兼容，关闭遥测后仍会打印发送失败的错误日志，与评测无关。
     logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
-    report = asyncio.run(run(args.embedding, args.modes, args.top_k, args.cache_dir))
+    report = asyncio.run(run(args.embedding, args.modes, args.top_k, args.cache_dir, args.rerank_margin))
     print(f"数据集：{report['dataset']['documents']} 篇文档版本，{report['dataset']['queries']} 条查询\n")
     print(format_table(report))
     if args.output:

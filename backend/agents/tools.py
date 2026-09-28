@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TYPE_CHECKING, Union
 
@@ -276,6 +277,27 @@ def handoff_tools() -> Dict[str, AgentToolSpec]:
     }
 
 
+def rag_search_policy() -> Dict[str, Any]:
+    """Agent 检索链路的配置，默认值来自检索评测（evaluation/retrieval_evaluator.py）：
+
+    - 查询改写默认关闭：换成中文 embedding 后改写几乎不提升召回，却让每次检索多约 1.6 秒。
+    - 重排默认 auto：只在前两个文档分数差小于 0.03 时触发。评测集上约 1/4 的查询会触发，
+      覆盖了 9/10 的向量排序错误。阈值是在同一评测集上选的，换数据后应重新评估。
+    """
+    rerank = os.getenv("ZHIYING_RAG_RERANK", "auto").strip().lower() or "auto"
+    if rerank not in {"always", "auto", "never"}:
+        rerank = "auto"
+    try:
+        margin = float(os.getenv("ZHIYING_RAG_RERANK_MARGIN", "0.03"))
+    except ValueError:
+        margin = 0.03
+    return {
+        "rewrite": os.getenv("ZHIYING_RAG_QUERY_REWRITE", "false").strip().lower() in {"1", "true", "yes", "on"},
+        "rerank": rerank,
+        "rerank_margin": margin,
+    }
+
+
 def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
     """构建所有 Agent 可共享的 RAG 工具。"""
 
@@ -290,10 +312,14 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
         if tool_manager is None:
             return {"success": False, "error": "RAG 工具未初始化", "results": []}
 
-        result = await tool_manager.search_with_rewrite(
+        policy = rag_search_policy()
+        result = await tool_manager.search(
             "knowledge_search",
             query,
             top_k=top_k,
+            rewrite=policy["rewrite"],
+            rerank=policy["rerank"],
+            rerank_margin=policy["rerank_margin"],
         )
         if not getattr(result, "success", False):
             return {
