@@ -442,3 +442,92 @@ def build_ticket_tool(tickets):
     return make_tool("create_ticket", "创建工单",
                      {"issue_type": {"type": "string"}, "priority": {"type": "string"}, "summary": {"type": "string"}},
                      create_ticket, ["issue_type", "priority", "summary"], "write")
+
+
+def _counting_tool(counter):
+    from agents.tools import make_tool
+
+    def handler(req, args):
+        counter.append(dict(args))
+        return {"success": True, "status": "已发货"}
+
+    return make_tool("lookup_status", "查询状态", {"order_id": {"type": "string"}}, handler, required=["order_id"])
+
+
+def _tool_call(call_id, order_id="A1"):
+    return _blocks({"type": "tool_use", "id": call_id, "name": "lookup_status", "input": {"order_id": order_id}})
+
+
+def test_repeated_identical_tool_call_is_not_executed_again():
+    executed = []
+    client = _ScriptedClient(_tool_call("t1"), _tool_call("t2"), _blocks({"type": "text", "text": "订单已发货。"}))
+    agent = GeneralAgent(client, "test-model")
+    agent.set_domain_tools({"lookup_status": _counting_tool(executed)})
+
+    response = asyncio.run(agent.handle(make_request(intent=IntentCategory.QUERY, entities={})))
+
+    assert response.success is True
+    assert executed == [{"order_id": "A1"}]
+    assert "已经用相同参数调用过" in response.tool_traces[1]["error"]
+
+
+def test_second_repeated_call_stops_the_loop_as_no_progress():
+    executed = []
+    client = _ScriptedClient(_tool_call("t1"), _tool_call("t2"), _tool_call("t3"))
+    agent = GeneralAgent(client, "test-model")
+    agent.set_domain_tools({"lookup_status": _counting_tool(executed)})
+
+    response = asyncio.run(agent.handle(make_request(intent=IntentCategory.QUERY, entities={})))
+
+    assert response.success is False
+    assert "无进展" in response.error
+    assert len(executed) == 1
+
+
+def test_llm_timeout_is_capped_by_remaining_agent_deadline(monkeypatch):
+    import time
+
+    monkeypatch.setenv("ZHIYING_AGENT_DEADLINE_S", "1")
+
+    class SlowClient:
+        class messages:
+            @staticmethod
+            async def create(**kwargs):
+                await asyncio.sleep(5)
+
+    agent = GeneralAgent(SlowClient(), "test-model")
+    t0 = time.monotonic()
+    response = asyncio.run(agent.handle(make_request(intent=IntentCategory.QUERY, entities={})))
+
+    assert response.success is False
+    assert time.monotonic() - t0 < 2.5
+
+
+def test_request_token_budget_stops_further_llm_rounds(monkeypatch):
+    import types
+
+    from core.llm_client import MeteredClient
+    from core.usage import track_request_usage
+
+    monkeypatch.setenv("ZHIYING_REQUEST_TOKEN_BUDGET", "100")
+    calls = []
+
+    class Messages:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            response = _tool_call(f"t{len(calls)}", order_id=f"A{len(calls)}")
+            response.usage = {"input_tokens": 100, "output_tokens": 20}
+            return response
+
+    agent = GeneralAgent(MeteredClient(types.SimpleNamespace(messages=Messages())), "test-model")
+    agent.set_domain_tools({"lookup_status": _counting_tool([])})
+
+    async def main():
+        with track_request_usage():
+            return await agent.handle(make_request(intent=IntentCategory.QUERY, entities={}))
+
+    response = asyncio.run(main())
+
+    assert response.success is False
+    assert "token 预算" in response.error
+    assert len(calls) == 1

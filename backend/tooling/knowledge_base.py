@@ -4,7 +4,7 @@ RAG 知识库 —— 基于 ChromaDB 的真实检索实现。
 功能：
   1. 文档导入：将文本切片后存入 ChromaDB（自动生成 Embedding）
   2. 语义检索：根据 query 从知识库中检索最相关的文档片段
-  3. 与 MCP 工具框架集成：作为 knowledge_search 工具的真实 handler
+  3. 与工具管理器集成：作为 knowledge_search 工具的真实 handler
 
 ChromaDB 在这里的角色：
   - memory/ 中用于存储对话记忆（情景记忆 + 用户画像）
@@ -38,31 +38,29 @@ class KnowledgeBase:
         chroma_host: str = "localhost",
         chroma_port: int = 8000,
         chroma_path: str = "./data/chroma",
+        embedding_function: Any = None,
+        collection_name: Optional[str] = None,
+        load_default_docs: bool = True,
+        client: Any = None,
     ):
-        # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
+        # 优先连接独立 ChromaDB 服务，不可用时退回本地持久化目录。
+        # 两种模式下 embedding 都在本进程计算（Dockerfile 因此预置了模型缓存）。
         self._use_server = False
-        try:
-            # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
-            self._client = chromadb.HttpClient(
-                host=chroma_host,
-                port=chroma_port,
-                settings=chromadb.Settings(anonymized_telemetry=False),
-            )
-            self._client.heartbeat()
-            self._use_server = True
-            logger.info(f"知识库 ChromaDB 已连接: {chroma_host}:{chroma_port}")
-        except Exception:
-            logger.info(f"知识库 ChromaDB 服务不可用，使用本地模式: {chroma_path}")
-            self._client = chromadb.PersistentClient(
-                path=chroma_path,
-                settings=chromadb.Settings(anonymized_telemetry=False),
-            )
+        if client is not None:
+            # 评测等场景直接注入客户端（例如临时目录里的 PersistentClient）。
+            self._client = client
+        else:
+            self._client = self._connect(chroma_host, chroma_port, chroma_path)
 
-        # 使用服务端时不传 embedding_function，让服务端处理
-        # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
+        # embedding_function 为空时使用 ChromaDB 默认模型 all-MiniLM-L6-v2（以英文为主）。
+        # 换模型会改变向量维度，必须换一个 collection 并重新导入，不能混用。
+        kwargs: Dict[str, Any] = {}
+        if embedding_function is not None:
+            kwargs["embedding_function"] = embedding_function
         self._collection = self._client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
+            name=collection_name or self.COLLECTION_NAME,
             metadata={"description": "ZhiYing Agent RAG 知识库", "hnsw:space": "cosine"},
+            **kwargs,
         )
         # 已存在的 collection 不会因为传入 hnsw:space 而改变索引，按实际距离类型换算分数。
         self._distance_space = (self._collection.metadata or {}).get("hnsw:space", "l2")
@@ -74,8 +72,27 @@ class KnowledgeBase:
         self._migrate_legacy_metadata()
 
         # 如果知识库为空，导入默认文档
-        if self._collection.count() == 0:
+        if load_default_docs and self._collection.count() == 0:
             self._load_default_docs()
+
+    def _connect(self, chroma_host: str, chroma_port: int, chroma_path: str) -> Any:
+        try:
+            # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
+            client = chromadb.HttpClient(
+                host=chroma_host,
+                port=chroma_port,
+                settings=chromadb.Settings(anonymized_telemetry=False),
+            )
+            client.heartbeat()
+            self._use_server = True
+            logger.info(f"知识库 ChromaDB 已连接: {chroma_host}:{chroma_port}")
+            return client
+        except Exception:
+            logger.info(f"知识库 ChromaDB 服务不可用，使用本地模式: {chroma_path}")
+            return chromadb.PersistentClient(
+                path=chroma_path,
+                settings=chromadb.Settings(anonymized_telemetry=False),
+            )
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
@@ -304,13 +321,13 @@ class KnowledgeBase:
     async def delete_version_async(self, source_id: str, version: str) -> int:
         return await asyncio.to_thread(self.delete_version, source_id, version)
 
-    # ── MCP 工具 handler ─────────────────────────────────────────────────────
+    # ── 工具 handler ─────────────────────────────────────────────────────────
 
     async def search_handler(self, params: Dict[str, Any], context: Any) -> List[Dict]:
         """
-        作为 MCP 工具的 handler 注册。
+        作为工具管理器的 handler 注册。
 
-        MCPToolManager.register(Tool(
+        ToolManager.register(Tool(
             name="knowledge_search",
             handler=kb.search_handler,
             ...

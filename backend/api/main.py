@@ -29,6 +29,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 from core.intent_recognizer import IntentCategory, intent_group_for
+from core.usage import current_request_usage, track_request_usage
 
 load_dotenv()
 
@@ -55,6 +56,7 @@ _monitor      = None
 _evaluator    = None
 _skill_manager = None
 _business_backend = None
+_mcp_provider = None
 # 完整评测会触发上百次 LLM 调用，同一进程内只允许一个评测运行，避免重复触发放大成本。
 _eval_lock = asyncio.Lock()
 
@@ -84,6 +86,7 @@ def _chroma_cfg() -> Dict[str, Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _business_backend
+    global _mcp_provider
 
     print(BANNER, flush=True)
 
@@ -92,8 +95,8 @@ async def lifespan(app: FastAPI):
     from business import BusinessWorkflow, MockBusinessBackend
     from core.intent_recognizer import IntentRecognizer
     from evaluation.evaluator import EndToEndEvaluator
-    from mcp.knowledge_base import KnowledgeBase
-    from mcp.tool_manager import MCPToolManager, Tool
+    from tooling.knowledge_base import KnowledgeBase
+    from tooling.tool_manager import ToolManager, Tool
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
@@ -142,18 +145,24 @@ async def lifespan(app: FastAPI):
     _orchestrator.set_domain_tools(build_business_tools(_business_backend, _memory))
     _orchestrator.set_business_workflow(BusinessWorkflow(_business_backend, _memory))
 
-    # MCP 工具管理器 + RAG 知识库（基于 ChromaDB 的真实检索）
-    _tool_manager = MCPToolManager(
+    # 工具管理器 + RAG 知识库（基于 ChromaDB 的真实检索）
+    _tool_manager = ToolManager(
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
     )
+    from tooling.embeddings import collection_name_for, get_embedding_function
+    embedding_model = os.getenv("ZHIYING_EMBEDDING_MODEL", "default").strip() or "default"
     kb = KnowledgeBase(
         chroma_host=chroma_cfg["host"],
         chroma_port=chroma_cfg["port"],
         chroma_path=chroma_cfg["path"],
+        embedding_function=get_embedding_function(
+            embedding_model, cache_dir=os.getenv("ZHIYING_EMBEDDING_CACHE_DIR") or None,
+        ),
+        collection_name=collection_name_for(embedding_model),
     )
-    logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
+    logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段（embedding={embedding_model}）")
 
     def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
         query = params.get("query", "")
@@ -184,6 +193,14 @@ async def lifespan(app: FastAPI):
     if _orchestrator is not None:
         _orchestrator.set_shared_tools(build_shared_rag_tools(_tool_manager))
 
+    # 外部 MCP Server：按 ZHIYING_MCP_SERVERS 配置连接，把显式允许的只读工具挂进对应 Agent。
+    from tooling.mcp_client import MCPToolProvider, load_configs_from_env
+    mcp_configs = load_configs_from_env()
+    if mcp_configs:
+        _mcp_provider = MCPToolProvider(mcp_configs)
+        await _mcp_provider.start()
+        _orchestrator.set_external_tools(_mcp_provider.tools_by_agent())
+
     # 性能监控（可选启动 Prometheus）
     prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
     _monitor = PerformanceMonitor(
@@ -209,6 +226,8 @@ async def lifespan(app: FastAPI):
     yield
 
     await _monitor.stop()
+    if _mcp_provider is not None:
+        await _mcp_provider.close()
     if _memory is not None:
         await _memory.close()
     logger.info("ZhiYing Agent 已关闭")
@@ -368,6 +387,7 @@ class ChatResponse(BaseModel):
     pending_action: Optional[Dict[str, Any]] = None
     ticket: Optional[Dict[str, Any]] = None
     task_state: Dict[str, Any] = Field(default_factory=dict)
+    token_usage: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolTraceResponse(BaseModel):
@@ -396,6 +416,12 @@ async def skills_summary():
     return _skill_manager.summary()
 
 
+@app.get("/mcp/servers", tags=["MCP"])
+async def mcp_servers_summary():
+    """查看外部 MCP Server 的连接状态，以及每个 Server 挂载和跳过的工具。"""
+    return {"servers": _mcp_provider.summary() if _mcp_provider is not None else []}
+
+
 @app.post("/skills/reload", tags=["Skills"])
 async def reload_skills():
     """运行时重新扫描 Skill 目录，不需要重启服务。"""
@@ -413,6 +439,12 @@ async def chat(req: ChatRequest, response: Response, request: FastAPIRequest):
     主对话接口。完整流程：
       记忆读取 → 意图识别 → Agent 路由 → 执行 → 记忆写入
     """
+    # 统计本次请求内所有 LLM 调用（意图、Agent、改写、重排、记忆压缩）的 token 用量。
+    with track_request_usage():
+        return await _chat(req, response, request)
+
+
+async def _chat(req: ChatRequest, response: Response, request: FastAPIRequest) -> ChatResponse:
     if _orchestrator is None or _memory is None:
         raise HTTPException(503, "服务未就绪")
 
@@ -487,9 +519,13 @@ async def chat(req: ChatRequest, response: Response, request: FastAPIRequest):
         persist_long_term=persist_long_term,
     )
 
-    # 5. 异步更新用户画像（不阻塞响应）
+    # 5. 异步更新用户画像（不阻塞响应）；它的用量只计入 Prometheus，不计入本次响应。
     if persist_long_term:
         asyncio.create_task(_memory.update_profile(memory_user_id, conv_id))
+
+    usage = current_request_usage()
+    token_usage = usage.summary() if usage is not None else {}
+    _orchestrator.annotate_trace(result.request_id, token_usage=token_usage)
 
     return ChatResponse(
         conv_id=conv_id,
@@ -515,6 +551,7 @@ async def chat(req: ChatRequest, response: Response, request: FastAPIRequest):
         pending_action=result.pending_action,
         ticket=result.ticket,
         task_state=result.task_state,
+        token_usage=token_usage,
     )
 
 
@@ -582,7 +619,7 @@ async def prometheus_metrics():
 async def search(query: str = Query(min_length=1, max_length=8000), top_k: int = Query(default=5, ge=1, le=10)):
     """
     演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
-    展示 MCP 工具调用的核心亮点。
+    展示工具调用框架的检索优化链路。
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")

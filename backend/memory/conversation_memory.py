@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 import chromadb
 import redis.asyncio as redis
 from core.llm_utils import extract_text_content
+from core.usage import llm_role
 from core.llm_client import create_llm_client
 
 logger = logging.getLogger(__name__)
@@ -204,10 +205,11 @@ class MemoryManager:
             prompt = self._safe_text(prompt)
 
             try:
-                resp = await asyncio.wait_for(self._client.messages.create(
-                model=self._model, max_tokens=512, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
-                ), timeout=self._llm_timeout_s())
+                with llm_role("memory_profile"):
+                    resp = await asyncio.wait_for(self._client.messages.create(
+                    model=self._model, max_tokens=512, temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                    ), timeout=self._llm_timeout_s())
                 raw = extract_text_content(resp.content)
                 s, e = raw.find("{"), raw.rfind("}") + 1
                 profile_data = json.loads(raw[s:e])
@@ -344,13 +346,14 @@ class MemoryManager:
         text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in to_compress))
         prompt = self._safe_text(f"用 2-3 句话总结以下对话的关键信息：\n{text}")
         try:
-            resp = await asyncio.wait_for(
-                self._client.messages.create(
-                    model=self._model, max_tokens=256, temperature=0.0,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=self._llm_timeout_s(),
-            )
+            with llm_role("memory_summary"):
+                resp = await asyncio.wait_for(
+                    self._client.messages.create(
+                        model=self._model, max_tokens=256, temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}],
+                    ),
+                    timeout=self._llm_timeout_s(),
+                )
             summary = self._safe_text(extract_text_content(resp.content)).strip()
         except Exception:
             summary = f"对话包含 {len(to_compress)} 条消息（摘要生成失败）"
@@ -547,15 +550,16 @@ class MemoryManager:
 """
         )
         try:
-            resp = await asyncio.wait_for(
-                self._client.messages.create(
-                    model=self._model,
-                    max_tokens=256,
-                    temperature=0.0,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=self._llm_timeout_s(),
-            )
+            with llm_role("memory_summary_merge"):
+                resp = await asyncio.wait_for(
+                    self._client.messages.create(
+                        model=self._model,
+                        max_tokens=256,
+                        temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}],
+                    ),
+                    timeout=self._llm_timeout_s(),
+                )
             merged = self._safe_text(extract_text_content(resp.content)).strip()
             if merged:
                 return merged[: self.SUMMARY_MAX_CHARS]

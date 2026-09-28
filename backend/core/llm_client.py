@@ -15,6 +15,8 @@ from typing import Any, Dict, Iterable, List, Optional
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
+from core.usage import record_llm_call
+
 
 @dataclass
 class TextBlock:
@@ -38,6 +40,7 @@ class ToolUseBlock:
 class LLMMessageResponse:
     content: List[Any]
     raw: Any = None
+    usage: Optional[Dict[str, int]] = None
 
 
 def _value(value: Any, key: str, default: Any = None) -> Any:
@@ -173,7 +176,22 @@ def openai_response_to_anthropic(response: Any) -> LLMMessageResponse:
             name=str(getattr(function, "name", "")),
             input=_json_arguments(getattr(function, "arguments", "{}")),
         ))
-    return LLMMessageResponse(content=content, raw=response)
+    return LLMMessageResponse(content=content, raw=response, usage=_openai_usage(response))
+
+
+def _openai_usage(response: Any) -> Optional[Dict[str, int]]:
+    """OpenAI 的 prompt_tokens 已包含缓存命中部分；转换成 Anthropic 的口径（不含缓存）。"""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    prompt = int(_value(usage, "prompt_tokens", 0) or 0)
+    details = _value(usage, "prompt_tokens_details", None)
+    cached = int(_value(details, "cached_tokens", 0) or 0) if details is not None else 0
+    return {
+        "input_tokens": prompt - cached,
+        "output_tokens": int(_value(usage, "completion_tokens", 0) or 0),
+        "cache_read_input_tokens": cached,
+    }
 
 
 class OpenAICompatibleMessages:
@@ -241,16 +259,37 @@ class QwenClient(OpenAICompatibleClient):
 LLMClient = Any
 
 
+class _MeteredMessages:
+    def __init__(self, inner: Any):
+        self._inner = inner
+
+    async def create(self, **kwargs: Any) -> Any:
+        response = await self._inner.create(**kwargs)
+        record_llm_call(kwargs.get("model", ""), response)
+        return response
+
+
+class MeteredClient:
+    """在任意 Anthropic 形状的客户端外面记录每次调用的 token 用量。"""
+
+    def __init__(self, inner: Any):
+        self._inner = inner
+        self.messages = _MeteredMessages(inner.messages)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 def create_llm_client(api_key: str, base_url: Optional[str] = None) -> LLMClient:
     provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
     if provider in {"deepseek", "deepseek_openai"}:
-        return DeepSeekClient(api_key=api_key, base_url=base_url)
+        return MeteredClient(DeepSeekClient(api_key=api_key, base_url=base_url))
     if provider in {"qwen", "qwen_openai", "dashscope"}:
-        return QwenClient(api_key=api_key, base_url=base_url)
+        return MeteredClient(QwenClient(api_key=api_key, base_url=base_url))
     if provider == "openai":
-        return OpenAICompatibleClient(api_key=api_key, base_url=base_url)
+        return MeteredClient(OpenAICompatibleClient(api_key=api_key, base_url=base_url))
 
     kwargs: Dict[str, Any] = {"api_key": api_key}
     if base_url:
         kwargs["base_url"] = base_url
-    return AsyncAnthropic(**kwargs)
+    return MeteredClient(AsyncAnthropic(**kwargs))

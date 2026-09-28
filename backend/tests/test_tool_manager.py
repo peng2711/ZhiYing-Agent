@@ -1,10 +1,10 @@
 import asyncio
 
-from mcp.tool_manager import MCPToolManager, ToolResult
+from tooling.tool_manager import ToolManager, ToolResult
 
 
 def test_parallel_recall_deduplicates_same_version_chunk_and_keeps_best_score():
-    manager = MCPToolManager.__new__(MCPToolManager)
+    manager = ToolManager.__new__(ToolManager)
 
     async def rewrite_query(query, n=3):
         return ["query-a", "query-b"]

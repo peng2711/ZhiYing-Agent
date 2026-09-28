@@ -28,9 +28,10 @@
 - **Agent Tool Use**：政策类和故障类问题可强制调用知识库，避免模型绕过数据源直接回答。
 - **RAG 知识库**：支持文档添加、版本生命周期、有效期过滤、切片、向量检索、查询改写、缓存与重排。
 - **分层记忆**：Redis 保存会话工作记忆，ChromaDB 保存情景记忆和用户画像。
-- **可观测链路**：记录请求 ID、路由结果、工具输入、缓存状态、重排状态和耗时。
+- **可观测链路**：记录请求 ID、路由结果、工具输入、缓存状态、重排状态和耗时；每次请求按环节（意图、各 Agent、改写、重排、记忆压缩）统计 token 用量，可按单价估算费用，并导出 Prometheus 指标。
 - **自动化评测**：提供意图识别、LLM-as-Judge、业务 E2E、安全确认、RAG 引用覆盖、P95 延迟和回归基线，并在前端展示发布级指标与逐条用例证据。
 - **动态 Skills**：业务规则以 Markdown Skill 维护，运行时按 Agent 注入。
+- **MCP**：知识库以 MCP Server 对外提供只读检索（stdio / Streamable HTTP）；Agent 也能作为 MCP Client 挂载外部 Server 的只读工具，仍走白名单、参数校验和 Trace。
 - **业务执行闭环**：支持模拟订单/物流查询、退款资格检查、退款执行和人工工单。
 - **安全确认**：退款采用 Redis 任务状态与两阶段确认，具有确认令牌、有效期和幂等保护。
 - **知识引用**：回答返回文档、版本、章节、更新时间和 chunk 等结构化来源。
@@ -82,7 +83,43 @@ flowchart LR
 - `dialog_intent_match`：当前一轮意图是否匹配逐轮标签。
 - `primary_task_retention`：多轮结束时是否仍保留全部主任务。
 
-这些业务指标不使用 LLM 打分，也不会修改演示数据库。项目不在 README 中预填虚构效果数字，实际结果以当前代码运行 `/eval/run` 的报告为准。
+这些业务指标不使用 LLM 打分，也不会修改演示数据库。项目不在 README 中预填虚构效果数字，实际结果以当前代码运行 `/eval/run` 的报告为准。对话评测还会输出 `avg_tokens_per_turn` 和 `avg_llm_calls_per_turn`（只统计线上链路，不含 Judge），上涨超过 5% 视为回归。
+
+### 检索评测
+
+`retrieval_corpus.json` 是 42 篇自建的模拟客服政策（含一组新旧版本和多组易混淆文档），`retrieval_cases.json` 是 87 条口语化查询及其应命中的文档。评测在临时目录里建独立知识库，按文档计算 Hit@K、Recall@K 和 MRR，并按查询类型（口语、同义改写、易混淆、精确术语、版本）拆分：
+
+```bash
+cd backend
+python -m evaluation.retrieval_evaluator --embedding default bge-small-zh
+# 需要 LLM 配置时可继续对比查询改写和重排的贡献
+python -m evaluation.retrieval_evaluator --embedding bge-small-zh --modes vector rewrite rerank rewrite+rerank
+```
+
+在这套自建数据上纯向量检索的一次运行结果如下。数据集由同一作者编写，绝对值可能偏乐观，应主要看两个模型之间的差距：
+
+| embedding | Hit@1 | Hit@3 | MRR |
+|---|---|---|---|
+| ChromaDB 默认（all-MiniLM-L6-v2） | 0.172 | 0.333 | 0.288 |
+| bge-small-zh-v1.5 | 0.885 | 0.977 | 0.927 |
+
+默认模型只在含 `401`、`502` 等字面词的查询上有效，口语化中文查询的 Hit@1 只有 0.07。通过 `ZHIYING_EMBEDDING_MODEL=bge-small-zh` 切换（独立 collection，切换后需重新导入知识库）。
+
+同一数据集上各环节的贡献（LLM 为 `qwen3.7-plus`，431 次调用中 1 次失败退回）：
+
+| embedding | 模式 | Hit@1 | Hit@3 | MRR | p50 耗时 | token/查询 |
+|---|---|---|---|---|---|---|
+| bge-small-zh | 纯向量 | 0.885 | 0.977 | 0.927 | 5 ms | 0 |
+| bge-small-zh | + 查询改写 | 0.897 | 0.966 | 0.936 | 1.6 s | 116 |
+| bge-small-zh | + LLM 重排 | 0.931 | 0.977 | 0.954 | 2.4 s | 1861 |
+| bge-small-zh | 改写 + 重排（线上链路） | 0.931 | 0.989 | 0.958 | 2.9 s | 954 |
+| 默认 | 纯向量 | 0.172 | 0.333 | 0.288 | 12 ms | 0 |
+| 默认 | + LLM 重排 | 0.713 | 0.724 | 0.721 | 2.3 s | 1846 |
+
+- embedding 是决定性因素：bge-small-zh 纯向量（0 token、5 ms）明显好于默认模型加重排。重排只能调整已召回候选的顺序，召回不到的文档救不回来，所以默认模型加重排后 Hit@3 仍只有 0.72。
+- 换成 bge-small-zh 后，查询改写几乎没有收益（Hit@3 反而下降 0.011），却让每次检索多花约 1.6 秒。
+- LLM 重排把 Hit@1 提高了 4.6 个百分点，但易混淆类查询的 Hit@1 从 1.00 降到 0.77。可能的原因是重排提示词把每条结果序列化成 JSON 后只截取前 200 字，元数据排在前面，正文被截掉了。
+- 改写 + 重排的 token 比单独重排少，是因为这条链路每个子查询只召回 5 条，重排的候选更少。
 
 ## 设计演进、失败与取舍
 
@@ -96,6 +133,7 @@ flowchart LR
 | 升级只生成一句摘要 | 用户无法获得可追踪处理编号 | 创建持久化工单并返回状态 | 当前不连接真实客服排班系统 |
 | RAG 只把文本塞回模型 | 用户看不到答案依据 | 返回文档、版本、章节、更新时间和 chunk | 引用元数据由服务端生成，避免模型编造来源 |
 | 本地跨端口请求未携带 Cookie | 访客身份可能逐轮变化，任务状态丢失 | Fetch 统一启用 `credentials: include` | CORS 必须使用明确来源并允许凭据 |
+| 知识库一直用 ChromaDB 默认 embedding | 默认模型以英文为主，中文口语查询 Hit@3 只有 0.33 | 新增检索评测集和 Hit@K/MRR 评测，支持 bge-small-zh | 换模型要换 collection 并重新导入，因此做成配置项而不是静默切换 |
 | 本地与容器 Chroma 默认值混用 | 数据可能写入意外目录 | 本地默认 `localhost:8001` 并回退仓库目录，Compose 显式使用 `chromadb:8000` | 服务模式和嵌入式模式保留同一接口 |
 
 ## 技术栈
@@ -177,6 +215,20 @@ Invoke-RestMethod `
   -ContentType 'application/json; charset=utf-8' `
   -InFile ./backend/examples/knowledge.json
 ```
+
+### 5. MCP（可选）
+
+知识库可以作为 MCP Server 单独运行，供 Claude Desktop、Claude Code 等 MCP 客户端调用：
+
+```bash
+cd backend
+python -m tooling.mcp_server                                  # stdio
+python -m tooling.mcp_server --transport streamable-http      # http://127.0.0.1:8765/mcp
+```
+
+只暴露 `search_knowledge_base` 和 `list_knowledge_versions` 两个只读工具。订单、退款、工单不走 MCP：MCP Server 拿不到调用方的登录身份，暴露它们等于绕过接口鉴权。
+
+反过来，后端也能挂载外部 MCP Server 的工具。在 `backend/.env` 中配置 `ZHIYING_MCP_SERVERS`（格式见 `.env.example`），只有显式列在 `tools` 中、并且 Server 声明为只读的工具才会挂进指定 Agent，工具名带 `mcp_<server>_` 前缀，不能覆盖内置工具。挂载结果可通过 `GET /mcp/servers` 查看。
 
 ## Docker Compose
 
@@ -261,7 +313,7 @@ ZhiYing-Agent/
 │   ├── agents/          # Agent 定义、路由与工具循环
 │   ├── api/             # FastAPI 接口
 │   ├── core/            # 意图识别、LLM 适配与 Skills
-│   ├── mcp/             # 工具管理和 RAG 知识库
+│   ├── tooling/         # 工具管理、RAG 知识库、MCP Server 与 Client
 │   ├── memory/          # Redis + ChromaDB 分层记忆
 │   ├── monitor/         # 指标和告警
 │   ├── evaluation/      # 自动化评测

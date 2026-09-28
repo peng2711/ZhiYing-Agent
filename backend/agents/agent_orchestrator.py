@@ -41,6 +41,7 @@ from agents.tools import (
     technical_tools,
 )
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel, intent_group_for
+from core.usage import current_request_usage, llm_role
 from core.llm_utils import extract_text_content
 from core.llm_client import LLMClient, create_llm_client
 from core.task_intent import TaskIntentTracker
@@ -127,6 +128,11 @@ class AgentResponse:
     citations: List[Dict[str, Any]] = field(default_factory=list)
     pending_action: Optional[Dict[str, Any]] = None
     ticket: Optional[Dict[str, Any]] = None
+    error: str = ""
+
+
+class AgentBudgetExceeded(RuntimeError):
+    """Agent 工具循环超出预算或判定为无进展，主动停止并交给上层降级。"""
 
 
 @dataclass
@@ -224,16 +230,20 @@ class BaseAgent:
         self.stats   = AgentStats()
         self._shared_tools: Dict[str, AgentToolSpec] = {}
         self._domain_tools: Dict[str, AgentToolSpec] = {}
+        self._external_tools: Dict[str, AgentToolSpec] = {}
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
-        """返回该角色真实可调用的工具白名单。"""
-        return {**self._shared_tools, **self._domain_tools}
+        """返回该角色真实可调用的工具白名单。外部 MCP 工具放在最前，不能覆盖内置工具。"""
+        return {**self._external_tools, **self._shared_tools, **self._domain_tools}
 
     def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
         self._shared_tools = dict(tools or {})
 
     def set_domain_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
         self._domain_tools = dict(tools or {})
+
+    def set_external_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
+        self._external_tools = dict(tools or {})
 
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
@@ -268,6 +278,7 @@ class BaseAgent:
                 latency_ms=ms,
                 tools_attempted=list(run.tools_attempted),
                 tool_traces=list(run.tool_traces),
+                error=str(ex),
             )
 
     async def _call_llm(self, req: Request, run: _AgentRun) -> str:
@@ -291,6 +302,12 @@ class BaseAgent:
         tools = self.get_tools()
         max_rounds = max(1, min(_env_int("ZHIYING_MAX_TOOL_ROUNDS", 3), 8))
         llm_timeout = max(1.0, _env_float("ZHIYING_LLM_TIMEOUT_S", 45.0))
+        # 三层终止条件：最大轮数（上面）、整次 Agent 执行的时间预算、单次请求的 token 预算；
+        # 另外检测"同一工具同样参数"的重复调用，模型原地打转时不必等到轮数耗尽。
+        deadline = time.monotonic() + max(1.0, _env_float("ZHIYING_AGENT_DEADLINE_S", 90.0))
+        token_budget = max(0, _env_int("ZHIYING_REQUEST_TOKEN_BUDGET", 0))
+        seen_calls: Dict[str, int] = {}
+        duplicate_calls = 0
         # 意图分类可能把“退款政策是什么”归为通用 QUERY。对明确询问政策、
         # 规则或依据的问题仍强制检索，避免仅凭模型参数记忆回答且没有引用。
         knowledge_markers = (
@@ -313,6 +330,14 @@ class BaseAgent:
         tool_traces = run.tool_traces
         citations = run.citations
         for round_idx in range(max_rounds):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AgentBudgetExceeded(f"{self.agent_type.value} 超出执行时间预算")
+            if token_budget:
+                usage = current_request_usage()
+                spent = usage.summary() if usage is not None else {}
+                if spent.get("input_tokens", 0) + spent.get("output_tokens", 0) >= token_budget:
+                    raise AgentBudgetExceeded(f"{self.agent_type.value} 超出单次请求 token 预算 {token_budget}")
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
                 "max_tokens": self.profile.max_tokens,
@@ -335,10 +360,11 @@ class BaseAgent:
                         "type": "tool",
                         "name": "search_knowledge_base",
                     }
-            resp = await asyncio.wait_for(
-                self._client.messages.create(**request_kwargs),
-                timeout=llm_timeout,
-            )
+            with llm_role(f"agent:{self.agent_type.value}"):
+                resp = await asyncio.wait_for(
+                    self._client.messages.create(**request_kwargs),
+                    timeout=min(llm_timeout, remaining),
+                )
             tool_uses = [block for block in (resp.content or []) if self._block_type(block) == "tool_use"]
             if not tool_uses:
                 if rag_required and round_idx == 0:
@@ -358,7 +384,21 @@ class BaseAgent:
                 call_success = True
                 result_success: Optional[bool] = None
                 error_text = ""
-                if spec is None:
+                signature = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)}"
+                is_duplicate = seen_calls.get(signature, 0) > 0
+                seen_calls[signature] = seen_calls.get(signature, 0) + 1
+                if is_duplicate:
+                    duplicate_calls += 1
+                    if duplicate_calls >= 2:
+                        raise AgentBudgetExceeded(f"{self.agent_type.value} 反复用相同参数调用 {name}，判定为无进展")
+                    # 第一次重复不执行，把原因告诉模型，给它一次换思路的机会。
+                    call_success = False
+                    result = {"success": False, "error": (
+                        f"{name} 已经用相同参数调用过，结果在上文。不要重复调用，"
+                        "请基于已有结果回答，或者换一个参数。"
+                    )}
+                    error_text = result["error"]
+                elif spec is None:
                     call_success = False
                     result: Any = {"success": False, "error": f"工具不在 {self.agent_type.value} Agent 白名单中"}
                     error_text = result["error"]
@@ -739,12 +779,13 @@ class ResponseComposer:
             if skill:
                 prompt += f"\n\n[通用客服输出边界]\n{skill}"
         try:
-            response = await self._client.messages.create(
-                model=self._model,
-                max_tokens=_env_int("ZHIYING_COMPOSER_MAX_TOKENS", 1000),
-                temperature=_env_float("ZHIYING_COMPOSER_TEMPERATURE", 0.1),
-                messages=[{"role": "user", "content": prompt}],
-            )
+            with llm_role("composer"):
+                response = await self._client.messages.create(
+                    model=self._model,
+                    max_tokens=_env_int("ZHIYING_COMPOSER_MAX_TOKENS", 1000),
+                    temperature=_env_float("ZHIYING_COMPOSER_TEMPERATURE", 0.1),
+                    messages=[{"role": "user", "content": prompt}],
+                )
             content = extract_text_content(response.content).strip()
             if content:
                 return content
@@ -877,6 +918,13 @@ class AgentOrchestrator:
             for agent in agents:
                 agent.set_domain_tools(configured.get(agent_type.value, {}))
 
+    def set_external_tools(self, tools_by_agent: Optional[Dict[str, Dict[str, AgentToolSpec]]]) -> None:
+        """挂载外部 MCP Server 提供的只读工具，按角色分配。"""
+        configured = tools_by_agent or {}
+        for agent_type, agents in self._pool.items():
+            for agent in agents:
+                agent.set_external_tools(configured.get(agent_type.value, {}))
+
     def set_business_workflow(self, workflow: Optional[Any]) -> None:
         self._business_workflow = workflow
 
@@ -912,7 +960,17 @@ class AgentOrchestrator:
             "ticket_id": result.ticket.get("ticket_id") if result.ticket else None,
             "latency_ms": round(result.latency_ms, 1),
         }
+        usage = current_request_usage()
+        if usage is not None:
+            trace["token_usage"] = usage.summary()
         self._recent_tool_traces.append(trace)
+
+    def annotate_trace(self, request_id: str, **fields: Any) -> None:
+        """补充编排结束后才产生的信息，例如写记忆时的压缩调用也计入 token 用量。"""
+        for trace in reversed(self._recent_tool_traces):
+            if trace.get("request_id") == request_id:
+                trace.update(fields)
+                return
 
     def get_tool_trace(self, request_id: str) -> Optional[Dict[str, Any]]:
         for trace in reversed(self._recent_tool_traces):

@@ -1,5 +1,5 @@
 """
-亮点：MCP 工具调用框架
+进程内工具调用框架（注意：不是 MCP 协议，MCP 适配见 mcp_server.py 和 mcp_client.py）
 
 核心问题：工具调用出错（检索不全、召回不好）怎么优化？
 
@@ -25,6 +25,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.llm_utils import extract_text_content
+from core.usage import llm_role
 from core.llm_client import create_llm_client
 
 logger = logging.getLogger(__name__)
@@ -144,11 +145,11 @@ class Tool:
     breaker: CircuitBreaker = field(default_factory=CircuitBreaker, init=False)
 
 
-# ── MCP 工具管理器 ────────────────────────────────────────────────────────────
+# ── 工具管理器 ────────────────────────────────────────────────────────────────
 
-class MCPToolManager:
+class ToolManager:
     """
-    MCP 工具调用框架。
+    进程内工具调用框架。
 
     核心优化链路（针对检索类工具）：
       用户查询 → 查询改写（多角度子查询）→ 并行召回 → 结果重排 → 返回 Top-K
@@ -338,13 +339,14 @@ class MCPToolManager:
 返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
         prompt = self._clean_text(prompt)
         try:
-            resp = await asyncio.wait_for(
-                self._client.messages.create(
-                    model=self._model, max_tokens=256, temperature=0.3,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=_llm_timeout_s(),
-            )
+            with llm_role("query_rewrite"):
+                resp = await asyncio.wait_for(
+                    self._client.messages.create(
+                        model=self._model, max_tokens=256, temperature=0.3,
+                        messages=[{"role": "user", "content": prompt}],
+                    ),
+                    timeout=_llm_timeout_s(),
+                )
             raw = extract_text_content(resp.content)
             s, e = raw.find("["), raw.rfind("]") + 1
             queries = json.loads(raw[s:e])
@@ -435,13 +437,14 @@ class MCPToolManager:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await asyncio.wait_for(
-                self._client.messages.create(
-                    model=self._model, max_tokens=256, temperature=0.0,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=_llm_timeout_s(),
-            )
+            with llm_role("rerank"):
+                resp = await asyncio.wait_for(
+                    self._client.messages.create(
+                        model=self._model, max_tokens=256, temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}],
+                    ),
+                    timeout=_llm_timeout_s(),
+                )
             raw = extract_text_content(resp.content)
             s, e = raw.find("["), raw.rfind("]") + 1
             order: List[int] = json.loads(raw[s:e])
